@@ -1,0 +1,2284 @@
+#!/usr/bin/env python3
+"""bwsh - Interactive bigWig file explorer.
+
+Browse genomic signal tracks by chromosome and coordinate,
+visualize signal in the terminal, compute region statistics.
+
+Usage:
+    bwsh signal.bw                  Interactive shell
+    bwsh signal.bw -c 'view chr1:1000-2000'   Run command and exit
+    bwsh signal.bw --chroms         List chromosomes
+"""
+
+import cmd
+import sys
+import os
+import re
+import shutil
+import readline
+import math
+import curses
+import termios
+import tty
+import select
+import fcntl
+import struct
+
+try:
+    import pyBigWig
+except ImportError:
+    print("bwsh requires pyBigWig: pip install pyBigWig", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import numpy as np
+except ImportError:
+    print("bwsh requires numpy: pip install numpy", file=sys.stderr)
+    sys.exit(1)
+
+
+# ── ANSI colors ─────────────────────────────────────────────
+
+class C:
+    BLUE = '\033[34m'
+    CYAN = '\033[36m'
+    GREEN = '\033[32m'
+    YELLOW = '\033[33m'
+    RED = '\033[31m'
+    MAGENTA = '\033[35m'
+    DIM = '\033[2m'
+    BOLD = '\033[1m'
+    RESET = '\033[0m'
+
+    @classmethod
+    def disable(cls):
+        for attr in ('BLUE', 'CYAN', 'GREEN', 'YELLOW', 'RED',
+                      'MAGENTA', 'DIM', 'BOLD', 'RESET'):
+            setattr(cls, attr, '')
+
+
+# ── Helpers ──────────────────────────────────────────────────
+
+BLOCKS = ' \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588'  # ▁▂▃▄▅▆▇█
+
+def format_bp(n):
+    """Format base pair count: 1234 -> '1,234 bp', 12345 -> '12.3 kb'."""
+    if n < 1000:
+        return f"{n} bp"
+    elif n < 1_000_000:
+        return f"{n/1000:.1f} kb"
+    elif n < 1_000_000_000:
+        return f"{n/1_000_000:.2f} Mb"
+    else:
+        return f"{n/1_000_000_000:.2f} Gb"
+
+
+def format_pos(n):
+    """Format position with commas: 1234567 -> '1,234,567'."""
+    return f"{n:,}"
+
+
+def format_size(nbytes):
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if abs(nbytes) < 1024:
+            if nbytes == int(nbytes):
+                return f"{int(nbytes)} {unit}"
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024
+    return f"{nbytes:.1f} TB"
+
+
+def parse_region(s, current_chrom=None, chrom_sizes=None):
+    """Parse region string into (chrom, start, end).
+
+    Supported formats:
+        chr1                     whole chromosome
+        chr1:1000-2000           standard
+        chr1:1,000-2,000         with commas
+        chr1:1000-2k             k/K/m/M suffixes
+        1000-2000                uses current chrom
+        1000                     single pos, +/- 500bp context
+    """
+    s = s.strip()
+
+    # Remove commas from numbers
+    s_clean = s.replace(',', '')
+
+    def parse_num(x):
+        """Parse number with optional k/m suffix."""
+        x = x.strip().lower()
+        if x.endswith('m') or x.endswith('mb'):
+            return int(float(x.rstrip('mb')) * 1_000_000)
+        elif x.endswith('k') or x.endswith('kb'):
+            return int(float(x.rstrip('kb')) * 1_000)
+        return int(x)
+
+    # Format: chr:start-end
+    m = re.match(r'^(\w+):(\S+)-(\S+)$', s_clean)
+    if m:
+        chrom = m.group(1)
+        start = parse_num(m.group(2))
+        end = parse_num(m.group(3))
+        return chrom, start, end
+
+    # Format: start-end (relative to current chrom)
+    m = re.match(r'^(\S+)-(\S+)$', s_clean)
+    if m and current_chrom:
+        start = parse_num(m.group(1))
+        end = parse_num(m.group(2))
+        return current_chrom, start, end
+
+    # Format: single number (center +/- 500)
+    try:
+        pos = parse_num(s_clean)
+        if current_chrom:
+            size = chrom_sizes.get(current_chrom, 1_000_000) if chrom_sizes else 1_000_000
+            start = max(0, pos - 500)
+            end = min(size, pos + 500)
+            return current_chrom, start, end
+    except ValueError:
+        pass
+
+    # Format: just a chromosome name
+    if chrom_sizes and s_clean in chrom_sizes:
+        return s_clean, 0, chrom_sizes[s_clean]
+
+    # Try case-insensitive chrom match
+    if chrom_sizes:
+        for name in chrom_sizes:
+            if name.lower() == s_clean.lower():
+                return name, 0, chrom_sizes[name]
+
+    return None, None, None
+
+
+def sparkline(values, width=None):
+    """Single-row sparkline from array of values."""
+    if width is None:
+        width = shutil.get_terminal_size((80, 24)).columns - 4
+
+    vals = np.array(values, dtype=np.float64)
+    vals = np.nan_to_num(vals, nan=0.0)
+
+    # Bin to width
+    if len(vals) > width:
+        binned = np.array_split(vals, width)
+        vals = np.array([np.mean(b) for b in binned])
+    elif len(vals) == 0:
+        return '(no data)'
+
+    vmin, vmax = np.min(vals), np.max(vals)
+    if vmax == vmin:
+        return BLOCKS[4] * len(vals)
+
+    norm = (vals - vmin) / (vmax - vmin)
+    return ''.join(BLOCKS[min(8, max(0, int(v * 8)))] for v in norm)
+
+
+def signal_plot(values, height=15, width=None):
+    """Multi-row signal plot with axis labels."""
+    if width is None:
+        tw = shutil.get_terminal_size((80, 24)).columns
+        width = tw - 12  # leave room for y-axis
+
+    vals = np.array(values, dtype=np.float64)
+    vals = np.nan_to_num(vals, nan=0.0)
+
+    # Bin to width
+    if len(vals) > width:
+        binned = np.array_split(vals, width)
+        vals = np.array([np.mean(b) for b in binned])
+
+    vmax = np.max(vals)
+    if vmax == 0:
+        return "  (all zeros in region)"
+
+    # Normalize to height
+    norm = vals / vmax * height
+
+    lines = []
+    for row in range(height, 0, -1):
+        chars = []
+        for v in norm:
+            if v >= row:
+                chars.append('\u2588')
+            elif v > row - 1:
+                frac = v - (row - 1)
+                idx = min(8, max(1, int(frac * 8)))
+                chars.append(BLOCKS[idx])
+            else:
+                chars.append(' ')
+
+        # Y-axis label
+        if row == height:
+            label = f"{vmax:>8.2f} \u2502"
+        elif row == 1:
+            label = f"{'0':>8} \u2502"
+        elif row == (height + 1) // 2:
+            label = f"{vmax / 2:>8.2f} \u2502"
+        else:
+            label = f"{'':>8} \u2502"
+
+        lines.append(label + ''.join(chars))
+
+    return '\n'.join(lines)
+
+
+# ── Main shell ───────────────────────────────────────────────
+
+class BWShell(cmd.Cmd):
+
+    def __init__(self, filename, no_color=False):
+        super().__init__()
+        if no_color or not sys.stdout.isatty():
+            C.disable()
+
+        self.filename = os.path.abspath(filename)
+        self.basename = os.path.basename(filename)
+        self.bw = pyBigWig.open(filename)
+        self.chroms = self.bw.chroms()  # {name: size}
+        self.chrom = None                # current chromosome
+        self.region = None               # last viewed (chrom, start, end)
+        self.nan_zero = True             # treat NaN/missing as 0 (True=mean, False=nanmean)
+        self.dark_bg = self._detect_dark_bg()
+        self.sixel = self._detect_sixel()
+        self.ymin = None               # None = auto (0 or data min)
+        self.ymax = None               # None = auto (data max)
+        self._update_prompt()
+
+        readline.set_completer_delims(' \t\n')
+
+        fsize = format_size(os.path.getsize(filename))
+        total_bp = sum(self.chroms.values())
+        self.intro = (
+            f"\n{C.BOLD}bwsh{C.RESET} - {C.CYAN}{self.basename}{C.RESET}"
+            f"  ({fsize}, {len(self.chroms)} chroms, {format_bp(total_bp)})\n"
+            f"Type {C.GREEN}help{C.RESET} for commands, "
+            f"{C.GREEN}chroms{C.RESET} to list chromosomes, "
+            f"{C.GREEN}q{C.RESET} to quit.\n"
+        )
+
+    @staticmethod
+    def _detect_dark_bg():
+        """Guess if terminal has dark background."""
+        fg_bg = os.environ.get('COLORFGBG', '')
+        if fg_bg:
+            try:
+                bg = int(fg_bg.split(';')[-1])
+                return bg < 8
+            except Exception:
+                pass
+        return False  # default: light bg
+
+    @staticmethod
+    def _detect_sixel():
+        """Detect sixel support via DA1 terminal query."""
+        fd = sys.stdin.fileno()
+        if not os.isatty(fd):
+            return False
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            sys.stdout.write('\033[c')
+            sys.stdout.flush()
+            buf = []
+            while select.select([fd], [], [], 0.5)[0]:
+                ch = os.read(fd, 1)
+                buf.append(ch)
+                if ch == b'c':
+                    break
+            resp = b''.join(buf).decode('ascii', errors='ignore')
+            if '?' in resp:
+                params = resp.split('?')[-1].rstrip('c').split(';')
+                return '4' in params
+        except Exception:
+            pass
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        return False
+
+    def _update_prompt(self):
+        if self.chrom:
+            self.prompt = f"{C.BOLD}bwsh{C.RESET}:{C.BLUE}{self.chrom}{C.RESET}> "
+        else:
+            self.prompt = f"{C.BOLD}bwsh{C.RESET}> "
+
+    def _parse(self, arg):
+        """Parse region argument, returns (chrom, start, end) or None tuple."""
+        if not arg.strip():
+            if self.region:
+                return self.region
+            if self.chrom:
+                return self.chrom, 0, self.chroms[self.chrom]
+            return None, None, None
+        return parse_region(arg, self.chrom, self.chroms)
+
+    def _apply_nan_zero(self, chrom, start, end, nbins):
+        """Fetch binned mean, optionally scaled by coverage (nan_zero mode)."""
+        means = self.bw.stats(chrom, start, end, type="mean", nBins=nbins)
+        arr = np.nan_to_num(np.array(means, dtype=np.float64), nan=0.0)
+        if self.nan_zero:
+            cov = self.bw.stats(chrom, start, end, type="coverage", nBins=nbins)
+            cov_arr = np.nan_to_num(np.array(cov, dtype=np.float64), nan=0.0)
+            arr *= cov_arr
+        return arr
+
+    def _get_values(self, chrom, start, end):
+        """Get signal values, using stats for large regions, values for small."""
+        span = end - start
+        tw = shutil.get_terminal_size((80, 24)).columns
+
+        if span <= 10_000:
+            vals = self.bw.values(chrom, start, end)
+            return np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+        else:
+            nbins = min(span, max(tw * 2, 1000))
+            return self._apply_nan_zero(chrom, start, end, nbins)
+
+    def _get_values_exact(self, chrom, start, end, nbins=None):
+        """Get exact binned values."""
+        if nbins:
+            return self._apply_nan_zero(chrom, start, end, nbins)
+        else:
+            vals = self.bw.values(chrom, start, end)
+            return np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+
+    def _complete_chrom(self, text, line, begidx, endidx):
+        """Tab-complete chromosome names."""
+        return [c for c in self.chroms if c.lower().startswith(text.lower())]
+
+    def _set_region(self, chrom, start, end):
+        """Update current region (for pan/zoom)."""
+        self.region = (chrom, start, end)
+        if self.chrom != chrom:
+            self.chrom = chrom
+            self._update_prompt()
+
+    # ── Navigation ───────────────────────────────────────────
+
+    def do_chroms(self, arg):
+        """List chromosomes with sizes.  Usage: chroms [-a]
+        -a  show all (including tiny scaffolds)"""
+        show_all = '-a' in arg
+
+        items = sorted(self.chroms.items(),
+                       key=lambda x: -x[1])
+
+        if not show_all:
+            # Filter: only show chroms > 1% of largest, or named chr*
+            largest = items[0][1] if items else 0
+            threshold = largest * 0.001
+            filtered = [(n, s) for n, s in items
+                        if s >= threshold or n.startswith('chr')]
+            if len(filtered) < len(items):
+                hidden = len(items) - len(filtered)
+                items_show = filtered
+            else:
+                hidden = 0
+                items_show = items
+        else:
+            items_show = items
+            hidden = 0
+
+        max_name = max(len(n) for n, _ in items_show) if items_show else 5
+        max_size = items_show[0][1] if items_show else 1
+        bar_width = min(30, shutil.get_terminal_size((80, 24)).columns - max_name - 20)
+
+        for name, size in items_show:
+            bar_len = int(size / max_size * bar_width) if max_size > 0 else 0
+            bar = '\u2588' * bar_len
+            current = ' *' if name == self.chrom else ''
+            print(f"  {C.GREEN}{name:<{max_name}}{C.RESET}  "
+                  f"{format_bp(size):>12}  {C.DIM}{bar}{C.RESET}{C.YELLOW}{current}{C.RESET}")
+
+        if hidden:
+            print(f"  {C.DIM}... {hidden} small scaffolds hidden (use chroms -a){C.RESET}")
+
+    def do_ls(self, arg):
+        """Alias for chroms."""
+        self.do_chroms(arg)
+
+    def do_cd(self, arg):
+        """Set current chromosome.  Usage: cd <chrom>  (cd - to go back)"""
+        if not arg.strip():
+            self.chrom = None
+            self.region = None
+            self._update_prompt()
+            return
+
+        name = arg.strip()
+        if name in self.chroms:
+            self.chrom = name
+            self.region = None
+            self._update_prompt()
+        else:
+            # Case-insensitive search
+            for c in self.chroms:
+                if c.lower() == name.lower():
+                    self.chrom = c
+                    self.region = None
+                    self._update_prompt()
+                    return
+            print(f"{C.RED}Unknown chromosome: {name}{C.RESET}")
+
+    complete_cd = _complete_chrom
+
+    def do_pwd(self, arg):
+        """Print current chromosome and last viewed region."""
+        if self.region:
+            chrom, start, end = self.region
+            print(f"{chrom}:{format_pos(start)}-{format_pos(end)} ({format_bp(end - start)})")
+        elif self.chrom:
+            print(f"{self.chrom} ({format_bp(self.chroms[self.chrom])})")
+        else:
+            print("(no chromosome selected)")
+
+    # ── Data viewing ─────────────────────────────────────────
+
+    def do_view(self, arg):
+        """ASCII signal plot.  Usage: view <region> [-h HEIGHT]
+
+        Examples:
+            view chr1:1000-2000        view chr1:1m-1.1m
+            view 5000-6000             (uses current chrom)
+            view                       (re-view last region)
+            view chr1:1000-2000 -h 20  (taller plot)
+        """
+        height = 15
+        parts = arg.split()
+        if '-h' in parts:
+            idx = parts.index('-h')
+            if idx + 1 < len(parts):
+                height = int(parts[idx + 1])
+                parts = parts[:idx] + parts[idx + 2:]
+        region_arg = ' '.join(parts)
+
+        chrom, start, end = self._parse(region_arg)
+        if chrom is None:
+            print(f"{C.RED}Cannot parse region. Usage: view chr1:1000-2000{C.RESET}")
+            return
+        if chrom not in self.chroms:
+            print(f"{C.RED}Unknown chromosome: {chrom}{C.RESET}")
+            return
+
+        size = self.chroms[chrom]
+        start = max(0, start)
+        end = min(size, end)
+        span = end - start
+
+        if span <= 0:
+            print(f"{C.RED}Invalid region: start >= end{C.RESET}")
+            return
+
+        self._set_region(chrom, start, end)
+
+        tw = shutil.get_terminal_size((80, 24)).columns
+        plot_width = tw - 12
+
+        # Get binned values for plotting
+        nbins = min(span, plot_width)
+        vals = self._get_values_exact(chrom, start, end, nbins=nbins)
+
+        vmax = np.max(vals)
+        vmean = np.mean(vals)
+        nonzero_frac = np.sum(vals > 0) / len(vals) * 100
+
+        print(f"\n  {C.BOLD}{chrom}:{format_pos(start)}-{format_pos(end)}{C.RESET}"
+              f"  ({format_bp(span)})"
+              f"  {C.DIM}max={vmax:.2f}  mean={vmean:.2f}  "
+              f"coverage={nonzero_frac:.0f}%{C.RESET}\n")
+
+        if vmax == 0:
+            print(f"  {C.DIM}(no signal in region){C.RESET}")
+        else:
+            print(signal_plot(vals, height=height, width=plot_width))
+
+        # X-axis
+        axis = f"{'':>8} \u2514" + '\u2500' * min(len(vals), plot_width) + '\u2518'
+        print(axis)
+        # Position labels
+        left_label = format_pos(start)
+        right_label = format_pos(end)
+        mid_label = format_pos((start + end) // 2)
+        pad = min(len(vals), plot_width)
+        spacing = pad - len(left_label) - len(right_label)
+        if spacing > len(mid_label) + 4:
+            mid_pos = pad // 2 - len(mid_label) // 2
+            label_line = left_label + ' ' * (mid_pos - len(left_label)) + mid_label
+            label_line += ' ' * (pad - len(label_line) - len(right_label)) + right_label
+        else:
+            label_line = left_label + ' ' * max(1, spacing) + right_label
+        print(f"{'':>9} {label_line}")
+        print()
+
+    complete_view = _complete_chrom
+
+    def do_cat(self, arg):
+        """Print raw values.  Usage: cat <region>
+
+        Examples:
+            cat chr1:1000-1020     Per-base values
+            cat chr1:1000-2000     Warns if region too large
+        """
+        chrom, start, end = self._parse(arg)
+        if chrom is None:
+            print(f"{C.RED}Cannot parse region. Usage: cat chr1:1000-2000{C.RESET}")
+            return
+        if chrom not in self.chroms:
+            print(f"{C.RED}Unknown chromosome: {chrom}{C.RESET}")
+            return
+
+        size = self.chroms[chrom]
+        start = max(0, start)
+        end = min(size, end)
+        span = end - start
+
+        if span > 10_000:
+            print(f"{C.YELLOW}Region is {format_bp(span)} ({span:,} values). "
+                  f"Use a smaller slice or 'view' for visualization.{C.RESET}")
+            print(f"  {C.DIM}cat {chrom}:{format_pos(start)}-{format_pos(start + 100)}{C.RESET}")
+            return
+
+        self._set_region(chrom, start, end)
+        vals = self.bw.values(chrom, start, end)
+        vals = np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+
+        print(f"{C.DIM}{chrom}:{format_pos(start)}-{format_pos(end)} "
+              f"({format_bp(span)}){C.RESET}")
+
+        # Print in columnar format: position  value
+        for i, v in enumerate(vals):
+            pos = start + i
+            if v == 0:
+                print(f"  {format_pos(pos):>12}  {C.DIM}{v:.4f}{C.RESET}")
+            else:
+                print(f"  {format_pos(pos):>12}  {v:.4f}")
+
+    complete_cat = _complete_chrom
+
+    def do_head(self, arg):
+        """First N bp of signal.  Usage: head [-n N] [chrom|region]  (default N=20)"""
+        n = 20
+        parts = arg.split()
+        if '-n' in parts:
+            idx = parts.index('-n')
+            if idx + 1 < len(parts):
+                n = int(parts[idx + 1])
+                parts = parts[:idx] + parts[idx + 2:]
+
+        region_arg = ' '.join(parts) if parts else ''
+
+        if region_arg and region_arg in self.chroms:
+            chrom = region_arg
+            start, end = 0, n
+        elif region_arg:
+            chrom, start, end = self._parse(region_arg)
+            if chrom is None:
+                print(f"{C.RED}Cannot parse. Usage: head [-n N] <chrom>{C.RESET}")
+                return
+            end = start + n
+        elif self.chrom:
+            chrom = self.chrom
+            start, end = 0, n
+        else:
+            print("No chromosome selected. Usage: head [-n N] <chrom>")
+            return
+
+        size = self.chroms.get(chrom, 0)
+        end = min(end, size)
+        self._set_region(chrom, start, end)
+
+        vals = self.bw.values(chrom, start, end)
+        vals = np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+
+        print(f"{C.DIM}{chrom}:{format_pos(start)}-{format_pos(end)}{C.RESET}")
+        for i, v in enumerate(vals):
+            pos = start + i
+            print(f"  {format_pos(pos):>12}  {v:.4f}")
+
+    complete_head = _complete_chrom
+
+    def do_tail(self, arg):
+        """Last N bp of signal.  Usage: tail [-n N] [chrom]  (default N=20)"""
+        n = 20
+        parts = arg.split()
+        if '-n' in parts:
+            idx = parts.index('-n')
+            if idx + 1 < len(parts):
+                n = int(parts[idx + 1])
+                parts = parts[:idx] + parts[idx + 2:]
+
+        chrom_arg = parts[0] if parts else None
+
+        if chrom_arg and chrom_arg in self.chroms:
+            chrom = chrom_arg
+        elif self.chrom:
+            chrom = self.chrom
+        else:
+            print("No chromosome selected. Usage: tail [-n N] <chrom>")
+            return
+
+        size = self.chroms[chrom]
+        start = max(0, size - n)
+        end = size
+        self._set_region(chrom, start, end)
+
+        vals = self.bw.values(chrom, start, end)
+        vals = np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+
+        print(f"{C.DIM}{chrom}:{format_pos(start)}-{format_pos(end)}{C.RESET}")
+        for i, v in enumerate(vals):
+            pos = start + i
+            print(f"  {format_pos(pos):>12}  {v:.4f}")
+
+    complete_tail = _complete_chrom
+
+    def do_peek(self, arg):
+        """Whole-chromosome sparkline overview.  Usage: peek [chrom]"""
+        if arg.strip() and arg.strip() in self.chroms:
+            chrom = arg.strip()
+        elif self.chrom:
+            chrom = self.chrom
+        else:
+            print("No chromosome selected. Usage: peek <chrom>")
+            return
+
+        size = self.chroms[chrom]
+        tw = shutil.get_terminal_size((80, 24)).columns
+        nbins = tw - 4
+
+        stats_mean = self.bw.stats(chrom, 0, size, type="mean", nBins=nbins)
+        stats_max_val = self.bw.stats(chrom, 0, size, type="max", nBins=nbins)
+        vals = np.nan_to_num(np.array(stats_mean, dtype=np.float64), nan=0.0)
+        vals_max = np.nan_to_num(np.array(stats_max_val, dtype=np.float64), nan=0.0)
+
+        overall_max = np.max(vals_max) if len(vals_max) > 0 else 0
+        overall_mean = np.mean(vals[vals > 0]) if np.any(vals > 0) else 0
+        coverage = np.sum(vals > 0) / len(vals) * 100
+
+        print(f"\n  {C.BOLD}{chrom}{C.RESET}  {format_bp(size)}"
+              f"  {C.DIM}max={overall_max:.2f}  mean(nonzero)={overall_mean:.2f}"
+              f"  coverage={coverage:.0f}%{C.RESET}")
+        print(f"  {C.GREEN}{sparkline(vals, width=nbins)}{C.RESET}")
+        print(f"  {C.DIM}{format_pos(0)}{' ' * (nbins - len(format_pos(0)) - len(format_pos(size)))}"
+              f"{format_pos(size)}{C.RESET}")
+        print()
+
+    complete_peek = _complete_chrom
+
+    # ── Pan & Zoom ───────────────────────────────────────────
+
+    def _pan(self, fraction):
+        """Pan current view by fraction of span."""
+        if not self.region:
+            print(f"{C.DIM}No active region. Use 'view' first.{C.RESET}")
+            return
+        chrom, start, end = self.region
+        span = end - start
+        shift = int(span * fraction)
+        size = self.chroms[chrom]
+        new_start = max(0, start + shift)
+        new_end = min(size, new_start + span)
+        new_start = max(0, new_end - span)
+        self.do_view(f"{chrom}:{new_start}-{new_end}")
+
+    def _zoom(self, factor):
+        """Zoom by factor (>1 = zoom out, <1 = zoom in)."""
+        if not self.region:
+            print(f"{C.DIM}No active region. Use 'view' first.{C.RESET}")
+            return
+        chrom, start, end = self.region
+        span = end - start
+        center = (start + end) // 2
+        new_span = max(20, int(span * factor))
+        size = self.chroms[chrom]
+        new_start = max(0, center - new_span // 2)
+        new_end = min(size, new_start + new_span)
+        new_start = max(0, new_end - new_span)
+        self.do_view(f"{chrom}:{new_start}-{new_end}")
+
+    def do_left(self, arg):
+        """Pan left 25%.  Usage: left [FRACTION]"""
+        frac = float(arg) if arg.strip() else 0.25
+        self._pan(-frac)
+
+    def do_right(self, arg):
+        """Pan right 25%.  Usage: right [FRACTION]"""
+        frac = float(arg) if arg.strip() else 0.25
+        self._pan(frac)
+
+    def do_zoomin(self, arg):
+        """Zoom in 2x.  Usage: zoomin [FACTOR]"""
+        factor = float(arg) if arg.strip() else 0.5
+        self._zoom(factor)
+
+    def do_zi(self, arg):
+        """Alias for zoomin."""
+        self.do_zoomin(arg)
+
+    def do_zoomout(self, arg):
+        """Zoom out 2x.  Usage: zoomout [FACTOR]"""
+        factor = float(arg) if arg.strip() else 2.0
+        self._zoom(factor)
+
+    def do_zo(self, arg):
+        """Alias for zoomout."""
+        self.do_zoomout(arg)
+
+    # ── Interactive browser (curses) ─────────────────────────
+
+    def do_browse(self, arg):
+        """Interactive genome browser.  Usage: browse [region]
+
+        Auto-detects sixel support. Uses pixel mode if available,
+        otherwise falls back to curses text mode.
+
+        Keys:
+            \u2190/\u2192 or h/l   Pan 25%
+            H/L           Pan 50%
+            \u2191/\u2193 or k/j   Zoom in/out 2\u00d7
+            1-8           Zoom to preset (1=100bp .. 8=100Mb)
+            g             Goto coordinate / region
+            c             Change chromosome
+            n             Toggle NaN mode (mean / nanmean)
+            t             Toggle light/dark theme (sixel only)
+            s             Print stats to status line
+            q / Esc       Exit browser
+        """
+        if self.sixel:
+            self.do_bp(arg)
+        else:
+            self.do_bc(arg)
+
+    complete_browse = _complete_chrom
+
+    def do_b(self, arg):
+        """Alias for browse."""
+        self.do_browse(arg)
+
+    def do_bc(self, arg):
+        """Curses text-mode browser (fallback).  Usage: bc [region]
+
+        Use this if your terminal does not support sixel graphics.
+        Keys: same as browse, plus r to cycle render modes.
+        """
+        chrom, start, end = self._parse(arg)
+        if chrom is None:
+            if self.chrom:
+                chrom = self.chrom
+                start, end = 0, self.chroms[chrom]
+            else:
+                chrom = sorted(self.chroms.keys())[0]
+                start, end = 0, self.chroms[chrom]
+
+        size = self.chroms.get(chrom, 0)
+        start = max(0, start)
+        end = min(size, end)
+
+        try:
+            curses.wrapper(self._browse_loop, chrom, start, end)
+        except Exception as e:
+            print(f"Browser error: {e}")
+
+    complete_b = _complete_chrom
+
+    def _browse_loop(self, stdscr, chrom, start, end):
+        """Main curses event loop for interactive browsing."""
+        curses.start_color()
+        curses.use_default_colors()
+        # All colors use -1 (default fg/bg) so they adapt to light/dark themes
+        curses.init_pair(1, -1, -1)                    # signal (default fg = adapts)
+        curses.init_pair(2, curses.COLOR_CYAN, -1)     # axes/chrome
+        curses.init_pair(3, curses.COLOR_BLUE, -1)     # stats (blue works on both themes)
+        curses.init_pair(4, -1, -1)                    # text
+        curses.init_pair(5, curses.COLOR_RED, -1)      # highlight
+
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        stdscr.timeout(-1)
+
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        except:
+            pass
+
+        status_msg = ""
+        # Render modes: 'halfblock' (solid bars, 2x vert), 'block' (classic),
+        #               'braille' (dot matrix, 2x horiz + 4x vert)
+        render_mode = 'halfblock'
+        RENDER_MODES = ['halfblock', 'block', 'braille']
+
+        ZOOM_PRESETS = [100, 1_000, 10_000, 100_000, 1_000_000,
+                        10_000_000, 50_000_000, 100_000_000]
+
+        while True:
+            size = self.chroms[chrom]
+            start = max(0, min(start, size - 100))
+            end = max(start + 20, min(end, size))
+            span = end - start
+
+            self._browse_draw(stdscr, chrom, start, end, status_msg,
+                              render_mode=render_mode)
+            status_msg = ""
+
+            key = stdscr.getch()
+
+            if key == ord('q') or key == 27:  # q or Esc
+                break
+
+            elif key == curses.KEY_LEFT or key == ord('h'):
+                shift = max(1, span // 4)
+                start -= shift
+                end -= shift
+
+            elif key == curses.KEY_RIGHT or key == ord('l'):
+                shift = max(1, span // 4)
+                start += shift
+                end += shift
+
+            elif key == ord('H'):
+                shift = max(1, span // 2)
+                start -= shift
+                end -= shift
+
+            elif key == ord('L'):
+                shift = max(1, span // 2)
+                start += shift
+                end += shift
+
+            elif key == curses.KEY_UP or key == ord('k') or key == ord('+'):
+                center = (start + end) // 2
+                new_span = max(20, span // 2)
+                start = center - new_span // 2
+                end = start + new_span
+
+            elif key == curses.KEY_DOWN or key == ord('j') or key == ord('-'):
+                center = (start + end) // 2
+                new_span = min(size, span * 2)
+                start = center - new_span // 2
+                end = start + new_span
+
+            elif ord('1') <= key <= ord('8'):
+                idx = key - ord('1')
+                center = (start + end) // 2
+                new_span = ZOOM_PRESETS[idx]
+                start = center - new_span // 2
+                end = start + new_span
+
+            elif key == ord('r'):
+                idx = RENDER_MODES.index(render_mode)
+                render_mode = RENDER_MODES[(idx + 1) % len(RENDER_MODES)]
+                labels = {'halfblock': 'half-block (2\u00d7 vert)',
+                          'block': 'block (classic)',
+                          'braille': 'braille (2\u00d7 horiz + 4\u00d7 vert)'}
+                status_msg = f"Render: {labels[render_mode]}"
+
+            elif key == ord('g'):
+                result = self._browse_input(stdscr, "Goto: ")
+                if result:
+                    c, s, e = parse_region(result, chrom, self.chroms)
+                    if c and c in self.chroms:
+                        chrom = c
+                        size = self.chroms[chrom]
+                        start, end = s, e
+                    else:
+                        status_msg = f"Invalid: {result}"
+
+            elif key == ord('c'):
+                result = self._browse_input(stdscr, "Chrom: ")
+                if result:
+                    result = result.strip()
+                    if result in self.chroms:
+                        chrom = result
+                        size = self.chroms[chrom]
+                        start, end = 0, size
+                    else:
+                        matched = None
+                        for cn in self.chroms:
+                            if cn.lower() == result.lower():
+                                matched = cn
+                                break
+                        if matched:
+                            chrom = matched
+                            size = self.chroms[chrom]
+                            start, end = 0, size
+                        else:
+                            status_msg = f"Unknown: {result}"
+
+            elif key == ord('s'):
+                try:
+                    vals = self._get_values(chrom, start, end)
+                    nz = vals[vals > 0]
+                    if len(nz) > 0:
+                        status_msg = (f"min={np.min(vals):.3g}  max={np.max(vals):.3g}  "
+                                      f"mean={np.mean(vals):.3g}  std={np.std(vals):.3g}  "
+                                      f"median={np.median(vals):.3g}  "
+                                      f"cov={len(nz)/len(vals)*100:.0f}%")
+                    else:
+                        status_msg = "No signal in region"
+                except:
+                    status_msg = "Stats error"
+
+            elif key == ord('n'):
+                self.nan_zero = not self.nan_zero
+                status_msg = "nan=0 (mean)" if self.nan_zero else "skip NaN (nanmean)"
+
+            elif key == ord('y'):
+                result = self._browse_input(stdscr, "ylim (ymax or ymin ymax or auto): ")
+                if result is not None:
+                    r = result.strip()
+                    if r.lower() == 'auto' or r == '':
+                        self.ymin = None
+                        self.ymax = None
+                        status_msg = "ylim: auto"
+                    else:
+                        parts = r.split()
+                        try:
+                            if len(parts) == 1:
+                                self.ymin = 0
+                                self.ymax = float(parts[0])
+                            else:
+                                self.ymin = float(parts[0])
+                                self.ymax = float(parts[1])
+                            status_msg = f"ylim: [{self.ymin:.4g}, {self.ymax:.4g}]"
+                        except ValueError:
+                            status_msg = f"Invalid: {r}"
+
+            elif key == curses.KEY_MOUSE:
+                try:
+                    _, mx, my, _, bstate = curses.getmouse()
+                    if bstate & curses.BUTTON4_PRESSED:
+                        center = (start + end) // 2
+                        new_span = max(20, span * 2 // 3)
+                        start = center - new_span // 2
+                        end = start + new_span
+                    elif bstate & (1 << 21):
+                        center = (start + end) // 2
+                        new_span = min(size, span * 3 // 2)
+                        start = center - new_span // 2
+                        end = start + new_span
+                except:
+                    pass
+
+            elif key == curses.KEY_RESIZE:
+                try:
+                    curses.update_lines_cols()
+                except AttributeError:
+                    pass  # Python < 3.7.1
+                stdscr.clear()
+
+        self._set_region(chrom, start, end)
+
+    def _browse_draw(self, stdscr, chrom, start, end, status_msg="",
+                     render_mode='halfblock'):
+        """Draw the browser view."""
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        span = end - start
+        size = self.chroms[chrom]
+
+        plot_width = width - 12
+        if plot_width < 10:
+            stdscr.addstr(0, 0, "Terminal too narrow")
+            stdscr.refresh()
+            return
+
+        # Braille uses 2x horizontal bins; block/halfblock use 1:1
+        if render_mode == 'braille':
+            data_bins = min(span, plot_width * 2)
+        else:
+            data_bins = min(span, plot_width)
+        try:
+            vals = self._get_values_exact(chrom, start, end, nbins=data_bins)
+        except:
+            vals = np.zeros(data_bins)
+
+        data_max = np.max(vals) if len(vals) > 0 else 0
+        data_min = np.min(vals) if len(vals) > 0 else 0
+        vmean = np.mean(vals) if len(vals) > 0 else 0
+        nonzero_frac = np.sum(vals > 0) / max(1, len(vals)) * 100
+
+        # Apply user ylim or auto
+        disp_ymin = self.ymin if self.ymin is not None else min(0, data_min)
+        disp_ymax = self.ymax if self.ymax is not None else data_max
+        if disp_ymax <= disp_ymin:
+            disp_ymax = disp_ymin + 1
+        vmax = disp_ymax  # used by draw functions
+
+        plot_height = max(3, height - 8)
+        plot_start_row = 3
+
+        # Effective resolution
+        if render_mode == 'braille':
+            eff_w = plot_width * 2
+            bp_per = span / max(1, eff_w)
+            res_str = f"{bp_per:.0f} bp/dot" if bp_per >= 1 else f"{1/bp_per:.0f} dot/bp"
+            mode_tag = " [braille]"
+        elif render_mode == 'halfblock':
+            bp_per = span / max(1, plot_width)
+            res_str = f"{bp_per:.0f} bp/col" if bp_per >= 1 else f"{1/bp_per:.0f} col/bp"
+            mode_tag = " [HD]"
+        else:
+            bp_per = span / max(1, plot_width)
+            res_str = f"{bp_per:.0f} bp/col" if bp_per >= 1 else f"{1/bp_per:.0f} col/bp"
+            mode_tag = " [block]"
+
+        # ── Header ──
+        header = f" {chrom}:{format_pos(start)}-{format_pos(end)}  ({format_bp(span)})"
+        self._safe_addstr(stdscr, 0, 0, header, curses.A_BOLD)
+
+        nan_tag = "" if self.nan_zero else " [nanmean]"
+        ylim_tag = "" if (self.ymin is None and self.ymax is None) else " [ylim]"
+        stats_line = (f" max={data_max:.2f}  mean={vmean:.2f}  "
+                      f"cov={nonzero_frac:.0f}%  [{res_str}]{mode_tag}{nan_tag}{ylim_tag}")
+        self._safe_addstr(stdscr, 1, 0, stats_line, curses.color_pair(3))
+
+        # ── Signal plot ──
+        SIG_ATTR = curses.color_pair(1) | curses.A_BOLD
+        AXIS_ATTR = curses.color_pair(2)
+
+        if disp_ymax > disp_ymin and len(vals) > 0:
+            if render_mode == 'braille':
+                self._draw_braille(stdscr, vals, disp_ymin, disp_ymax, plot_start_row,
+                                   plot_height, plot_width, SIG_ATTR, AXIS_ATTR)
+            elif render_mode == 'halfblock':
+                self._draw_halfblock(stdscr, vals, disp_ymin, disp_ymax, plot_start_row,
+                                     plot_height, plot_width, SIG_ATTR, AXIS_ATTR)
+            else:
+                self._draw_blocks(stdscr, vals, disp_ymin, disp_ymax, plot_start_row,
+                                  plot_height, plot_width, SIG_ATTR, AXIS_ATTR)
+        else:
+            row = plot_start_row + plot_height // 2
+            self._safe_addstr(stdscr, row, 10, "(no signal in region)", curses.A_DIM)
+            for ri in range(plot_height):
+                self._safe_addstr(stdscr, plot_start_row + ri, 0,
+                                  f"{'':>8} \u2502", AXIS_ATTR)
+
+        # ── X-axis ──
+        xaxis_y = plot_start_row + plot_height
+        axis_line = f"{'':>9}\u2514" + '\u2500' * plot_width + '\u2518'
+        self._safe_addstr(stdscr, xaxis_y, 0, axis_line, AXIS_ATTR)
+
+        label_y = xaxis_y + 1
+        left_label = format_pos(start)
+        right_label = format_pos(end)
+        mid_label = format_pos((start + end) // 2)
+        self._safe_addstr(stdscr, label_y, 10, left_label, curses.A_DIM)
+        mid_x = 10 + plot_width // 2 - len(mid_label) // 2
+        if (mid_x > 10 + len(left_label) + 2
+                and mid_x + len(mid_label) < 10 + plot_width - len(right_label) - 2):
+            self._safe_addstr(stdscr, label_y, mid_x, mid_label, curses.A_DIM)
+        self._safe_addstr(stdscr, label_y, 10 + plot_width - len(right_label),
+                          right_label, curses.A_DIM)
+
+        # ── Minimap ──
+        minimap_y = height - 3
+        if minimap_y > label_y + 1:
+            mini_width = width - 4
+            try:
+                mini_vals = self.bw.stats(chrom, 0, size, type="mean", nBins=mini_width)
+                mini_arr = np.nan_to_num(np.array(mini_vals, dtype=np.float64), nan=0.0)
+            except:
+                mini_arr = np.zeros(mini_width)
+
+            mini_max = np.max(mini_arr) if len(mini_arr) > 0 else 1
+            if mini_max == 0:
+                mini_max = 1
+
+            vp_s = int(start / size * mini_width)
+            vp_e = int(end / size * mini_width)
+            vp_s = max(0, min(mini_width - 1, vp_s))
+            vp_e = max(vp_s + 1, min(mini_width, vp_e))
+
+            self._safe_addstr(stdscr, minimap_y, 0, f" {chrom} ", curses.A_DIM)
+            offset = len(chrom) + 3
+
+            for i in range(mini_width):
+                x = offset + i
+                if x >= width - 1:
+                    break
+                v = mini_arr[i] if i < len(mini_arr) else 0
+                bi = min(8, max(0, int(v / mini_max * 8)))
+                ch = BLOCKS[bi] if bi > 0 else '\u2581'
+
+                if vp_s <= i < vp_e:
+                    # Viewport: reverse video — always visible on any theme
+                    self._safe_addstr(stdscr, minimap_y, x, ch, curses.A_REVERSE | curses.A_BOLD)
+                else:
+                    self._safe_addstr(stdscr, minimap_y, x, ch, curses.A_DIM)
+
+        # ── Help bar ──
+        help_y = height - 1
+        if status_msg:
+            self._safe_addstr(stdscr, help_y, 0, f" {status_msg}",
+                              curses.color_pair(3) | curses.A_BOLD)
+        else:
+            help_str = (" \u2190\u2192:pan  \u2191\u2193:zoom  1-8:presets  "
+                        "g:goto  c:chrom  r:render  n:nan  y:ylim  s:stats  q:quit")
+            self._safe_addstr(stdscr, help_y, 0, help_str, curses.A_DIM)
+
+        stdscr.refresh()
+
+    def _draw_blocks(self, stdscr, vals, ymin, ymax, start_row, plot_h, plot_w,
+                     sig_attr, axis_attr):
+        """Block-character signal plot (1:1 column mapping)."""
+        span_y = ymax - ymin
+        # Resample to plot_w bins
+        if len(vals) > plot_w:
+            binned = np.array_split(vals, plot_w)
+            pv = np.array([np.mean(b) for b in binned])
+        elif len(vals) < plot_w:
+            pv = np.interp(np.linspace(0, 1, plot_w),
+                           np.linspace(0, 1, len(vals)), vals)
+        else:
+            pv = vals
+        norm = np.clip((pv - ymin) / span_y * plot_h, 0, plot_h)
+
+        for ri in range(plot_h):
+            row_val = plot_h - ri
+            ry = start_row + ri
+
+            if ri == 0:
+                label = f"{ymax:>8.2f} \u2502"
+            elif ri == plot_h - 1:
+                label = f"{ymin:>8.2f} \u2502"
+            elif ri == plot_h // 2:
+                mid_val = (ymin + ymax) / 2
+                label = f"{mid_val:>8.2f} \u2502"
+            else:
+                label = f"{'':>8} \u2502"
+            self._safe_addstr(stdscr, ry, 0, label, axis_attr)
+
+            chars = []
+            for v in norm[:plot_w]:
+                if v >= row_val:
+                    chars.append('\u2588')
+                elif v > row_val - 1:
+                    idx = min(8, max(1, int((v - (row_val - 1)) * 8)))
+                    chars.append(BLOCKS[idx])
+                else:
+                    chars.append(' ')
+            self._safe_addstr(stdscr, ry, 10, ''.join(chars), sig_attr)
+
+    def _draw_halfblock(self, stdscr, vals, ymin, ymax, start_row, plot_h, plot_w,
+                        sig_attr, axis_attr):
+        """Half-block signal plot: solid filled bars with 2x vertical resolution.
+
+        Uses \u2584 (lower half) and \u2588 (full block). Each character row
+        encodes 2 vertical pixels, so effective vertical resolution = plot_h * 2.
+        Looks identical to block mode but with smoother peak edges.
+        """
+        span_y = ymax - ymin
+        px_h = plot_h * 2  # 2 vertical pixels per char row
+
+        # Resample to plot_w (1:1 horizontal, same as block mode)
+        if len(vals) > plot_w:
+            binned = np.array_split(vals, plot_w)
+            pv = np.array([np.mean(b) for b in binned])
+        elif len(vals) < plot_w:
+            pv = np.interp(np.linspace(0, 1, plot_w),
+                           np.linspace(0, 1, len(vals)), vals)
+        else:
+            pv = vals
+        norm = np.clip((pv - ymin) / span_y * px_h, 0, px_h)
+
+        for cr in range(plot_h):
+            ry = start_row + cr
+
+            # Y-axis label
+            if cr == 0:
+                label = f"{ymax:>8.2f} \u2502"
+            elif cr == plot_h - 1:
+                label = f"{ymin:>8.2f} \u2502"
+            elif cr == plot_h // 2:
+                mid_val = (ymin + ymax) / 2
+                label = f"{mid_val:>8.2f} \u2502"
+            else:
+                label = f"{'':>8} \u2502"
+            self._safe_addstr(stdscr, ry, 0, label, axis_attr)
+
+            # Two pixel rows per character cell:
+            #   py_upper (top half) = higher threshold
+            #   py_lower (bottom half) = lower threshold
+            # pixel_y 0 = bottom of plot, px_h-1 = top
+            py_upper = (plot_h - 1 - cr) * 2 + 1
+            py_lower = (plot_h - 1 - cr) * 2
+
+            chars = []
+            for v in norm[:plot_w]:
+                if v > py_upper:
+                    chars.append('\u2588')   # full block: both halves filled
+                elif v > py_lower:
+                    chars.append('\u2584')   # lower half: signal just enters cell
+                else:
+                    chars.append(' ')
+            self._safe_addstr(stdscr, ry, 10, ''.join(chars), sig_attr)
+
+    def _draw_braille(self, stdscr, vals, ymin, ymax, start_row, plot_h, plot_w,
+                      sig_attr, axis_attr):
+        """Braille signal plot: 2x horizontal, 4x vertical resolution.
+
+        Each character cell is a 2-wide x 4-tall dot matrix (U+2800-U+28FF).
+        Effective pixel grid: (plot_w * 2) x (plot_h * 4).
+        """
+        span_y = ymax - ymin
+        px_w = plot_w * 2
+        px_h = plot_h * 4
+
+        # Resample to pixel width
+        if len(vals) > px_w:
+            binned = np.array_split(vals, px_w)
+            pv = np.array([np.mean(b) for b in binned])
+        elif len(vals) < px_w:
+            pv = np.interp(np.linspace(0, 1, px_w),
+                           np.linspace(0, 1, len(vals)), vals)
+        else:
+            pv = vals
+        norm = np.clip((pv - ymin) / span_y * px_h, 0, px_h)
+
+        # Braille dot bits: [sub_row][sub_col] -> bitmask
+        # sub_row 0 = top of cell, 3 = bottom
+        DB = [[0x01, 0x08],   # row 0
+              [0x02, 0x10],   # row 1
+              [0x04, 0x20],   # row 2
+              [0x40, 0x80]]   # row 3
+
+        for cr in range(plot_h):
+            ry = start_row + cr
+
+            # Y-axis label
+            if cr == 0:
+                label = f"{ymax:>8.2f} \u2502"
+            elif cr == plot_h - 1:
+                label = f"{ymin:>8.2f} \u2502"
+            elif cr == plot_h // 2:
+                mid_val = (ymin + ymax) / 2
+                label = f"{mid_val:>8.2f} \u2502"
+            else:
+                label = f"{'':>8} \u2502"
+            self._safe_addstr(stdscr, ry, 0, label, axis_attr)
+
+            chars = []
+            for cc in range(plot_w):
+                code = 0x2800  # braille blank
+                for sc in range(2):  # left/right dot column
+                    px_x = cc * 2 + sc
+                    if px_x >= len(norm):
+                        continue
+                    h = norm[px_x]
+                    for sr in range(4):  # dot rows top-to-bottom
+                        # pixel y for this dot (0 = bottom of plot)
+                        py = (plot_h - 1 - cr) * 4 + (3 - sr)
+                        if h > py:
+                            code |= DB[sr][sc]
+                chars.append(chr(code))
+            self._safe_addstr(stdscr, ry, 10, ''.join(chars), sig_attr)
+
+    def _browse_input(self, stdscr, prompt):
+        """Get text input in curses mode."""
+        height, width = stdscr.getmaxyx()
+        y = height - 1
+        curses.echo()
+        curses.curs_set(1)
+        stdscr.move(y, 0)
+        stdscr.clrtoeol()
+        self._safe_addstr(stdscr, y, 0, prompt, curses.A_BOLD)
+        stdscr.refresh()
+        try:
+            raw = stdscr.getstr(y, len(prompt), min(60, width - len(prompt) - 1))
+            result = raw.decode('utf-8').strip()
+        except:
+            result = ""
+        curses.noecho()
+        curses.curs_set(0)
+        return result
+
+    @staticmethod
+    def _safe_addstr(win, y, x, s, attr=0):
+        """addstr that silently clips to window bounds."""
+        try:
+            height, width = win.getmaxyx()
+            if y < 0 or y >= height or x >= width:
+                return
+            max_len = width - x - 1
+            if max_len <= 0:
+                return
+            win.addnstr(y, x, s, max_len, attr)
+        except curses.error:
+            pass
+
+    # ── Sixel pixel browser ───────────────────────────────────
+
+    def do_bp(self, arg):
+        """Pixel-mode browser (sixel graphics).  Usage: bp [region]
+
+        Same keybindings as browse. Renders signal as actual pixels
+        via sixel protocol — true pixel resolution, no character grid.
+        Requires a sixel-capable terminal (iTerm2, WezTerm, foot, kitty*, xterm).
+
+        Keys: same as browse (arrows/hjkl pan/zoom, 1-8 presets, g goto,
+              c chrom, s stats, q quit)
+        """
+        chrom, start, end = self._parse(arg)
+        if chrom is None:
+            if self.chrom:
+                chrom = self.chrom
+                start, end = 0, self.chroms[chrom]
+            else:
+                chrom = sorted(self.chroms.keys())[0]
+                start, end = 0, self.chroms[chrom]
+
+        size = self.chroms.get(chrom, 0)
+        start = max(0, start)
+        end = min(size, end)
+
+        try:
+            self._browse_sixel(chrom, start, end)
+        except Exception as e:
+            print(f"Sixel browser error: {e}")
+
+    complete_bp = _complete_chrom
+
+    def _get_terminal_pixels(self):
+        """Query terminal pixel dimensions. Returns (rows, cols, xpix, ypix)."""
+        try:
+            fd = sys.stdin.fileno()
+            result = fcntl.ioctl(fd, termios.TIOCGWINSZ, b'\x00' * 8)
+            rows, cols, xpix, ypix = struct.unpack('HHHH', result)
+            if xpix > 0 and ypix > 0:
+                return rows, cols, xpix, ypix
+        except:
+            pass
+        # Fallback: estimate from character size
+        rows, cols = shutil.get_terminal_size()
+        return rows, cols, cols * 8, rows * 16
+
+    def _read_key(self, fd):
+        """Read a single keypress in raw/cbreak terminal mode."""
+        ch = os.read(fd, 1)
+        if ch == b'\x1b':
+            # Possible escape sequence
+            if select.select([fd], [], [], 0.05)[0]:
+                ch2 = os.read(fd, 1)
+                if ch2 == b'[':
+                    if select.select([fd], [], [], 0.05)[0]:
+                        ch3 = os.read(fd, 1)
+                        if ch3 == b'A': return 'UP'
+                        if ch3 == b'B': return 'DOWN'
+                        if ch3 == b'C': return 'RIGHT'
+                        if ch3 == b'D': return 'LEFT'
+                        # Consume any remaining bytes
+                        while select.select([fd], [], [], 0.01)[0]:
+                            os.read(fd, 1)
+            return 'ESC'
+        if ch == b'\r' or ch == b'\n':
+            return 'ENTER'
+        try:
+            return ch.decode('ascii')
+        except:
+            return ''
+
+    def _read_line_esc(self, fd):
+        """Read a line in cbreak mode; ESC cancels (returns None), Enter confirms."""
+        buf = []
+        w = sys.stdout.write
+        while True:
+            ch = os.read(fd, 1)
+            if ch == b'\x1b':  # ESC
+                # Drain any escape sequence bytes
+                while select.select([fd], [], [], 0.03)[0]:
+                    os.read(fd, 1)
+                return None
+            elif ch == b'\r' or ch == b'\n':
+                w('\r\n')
+                sys.stdout.flush()
+                return ''.join(buf)
+            elif ch in (b'\x7f', b'\x08'):  # Backspace/DEL
+                if buf:
+                    buf.pop()
+                    w('\b \b')
+                    sys.stdout.flush()
+            elif ch == b'\x03':  # Ctrl-C
+                return None
+            else:
+                try:
+                    c = ch.decode('ascii')
+                    if c.isprintable():
+                        buf.append(c)
+                        w(c)
+                        sys.stdout.flush()
+                except Exception:
+                    pass
+        return ''.join(buf)
+
+    def _render_signal_pixels(self, vals, width, height, ymin=0, ymax=None):
+        """Render signal to pixel array (H x W, uint8: 0=bg, 1=signal, 2=axis)."""
+        if len(vals) != width:
+            resampled = np.interp(
+                np.linspace(0, 1, width),
+                np.linspace(0, 1, len(vals)), vals)
+        else:
+            resampled = np.asarray(vals, dtype=np.float64)
+
+        if ymax is None:
+            ymax = np.max(resampled)
+        span_y = ymax - ymin
+        if span_y <= 0:
+            pixels = np.zeros((height, width), dtype=np.uint8)
+        else:
+            norm = np.clip((resampled - ymin) / span_y * height, 0, height).astype(np.int32)
+            row_idx = np.arange(height)[:, np.newaxis]
+            threshold = (height - norm)[np.newaxis, :]
+            pixels = (row_idx >= threshold).astype(np.uint8)
+
+        # Axis lines (value 2, drawn on top of signal)
+        pixels[-1, :] = 2     # x-axis along bottom
+        pixels[:, 0] = 2      # y-axis along left edge
+        # Y-axis tick marks at 25%, 50%, 75%
+        for frac in (0.25, 0.5, 0.75):
+            y = int(height * (1 - frac))
+            if 0 <= y < height:
+                pixels[y, 0:4] = 2
+
+        return pixels
+
+    def _encode_sixel(self, pixels):
+        """Encode pixel array as sixel with explicit bg/signal/axis colors.
+
+        pixels: (H, W) uint8 — 0=background, 1=signal, 2=axis.
+        All pixels are painted explicitly (no transparency needed).
+        """
+        h, w = pixels.shape
+        pad = (6 - h % 6) % 6
+        if pad:
+            pixels = np.vstack([np.zeros((pad, w), dtype=np.uint8), pixels])
+            h += pad
+
+        n_bands = h // 6
+        parts = ['\033Pq']
+        parts.append(f'"1;1;{w};{h}')
+
+        # Theme-aware colors (sixel uses 0-100 percentage)
+        if self.dark_bg:
+            parts.append('#0;2;12;12;12')     # bg: near-black
+            parts.append('#1;2;85;85;85')     # signal: light grey
+            parts.append('#2;2;35;35;35')     # axis: dim grey
+        else:
+            parts.append('#0;2;100;100;100')  # bg: white
+            parts.append('#1;2;8;8;8')        # signal: near-black
+            parts.append('#2;2;65;65;65')     # axis: medium grey
+
+        for band in range(n_bands):
+            chunk = pixels[band * 6:band * 6 + 6, :]
+            first = True
+
+            for val in range(3):  # 0=bg, 1=signal, 2=axis
+                mask = (chunk == val)
+                packed = np.zeros(w, dtype=np.uint8)
+                for bit in range(6):
+                    packed |= (mask[bit].astype(np.uint8) << bit)
+                if not np.any(packed):
+                    continue
+                if not first:
+                    parts.append('$')  # rewind to start of band
+                parts.append('#%d' % val)
+                parts.append(self._sixel_rle(packed))
+                first = False
+
+            if band + 1 < n_bands:
+                parts.append('-')
+
+        parts.append('\033\\')
+        return ''.join(parts)
+
+    @staticmethod
+    def _sixel_rle(packed):
+        """RLE-encode a row of sixel values (numpy uint8 array)."""
+        # Convert to sixel characters
+        chars = (packed + 0x3F).tobytes()
+        if not chars:
+            return ''
+
+        result = []
+        i = 0
+        n = len(chars)
+        while i < n:
+            ch = chars[i]
+            count = 1
+            while i + count < n and chars[i + count] == ch and count < 255:
+                count += 1
+            if count >= 3:
+                result.append(f'!{count}')
+                result.append(chr(ch))
+            else:
+                result.append(chr(ch) * count)
+            i += count
+        return ''.join(result)
+
+    def _browse_sixel(self, chrom, start, end):
+        """Sixel-based interactive genome browser."""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+
+        ZOOM_PRESETS = [100, 1_000, 10_000, 100_000, 1_000_000,
+                        10_000_000, 50_000_000, 100_000_000]
+        status_msg = ''
+        w = sys.stdout.write
+
+        try:
+            tty.setcbreak(fd)
+            w('\033[?25l')  # hide cursor
+            sys.stdout.flush()
+
+            while True:
+                size = self.chroms[chrom]
+                start = max(0, min(start, size - 100))
+                end = max(start + 20, min(end, size))
+                span = end - start
+
+                # Terminal dimensions
+                t_rows, t_cols, t_xpix, t_ypix = self._get_terminal_pixels()
+                cell_w = max(1, t_xpix // t_cols)
+                cell_h = max(1, t_ypix // t_rows)
+
+                # Text lines: header(1) + stats(1) + [plot] + xaxis(1) + help(1) = 4
+                text_lines = 4
+                y_margin = 6  # chars reserved for y-axis labels
+                plot_char_rows = max(5, t_rows - text_lines)
+                plot_px_w = max(100, (t_cols - y_margin) * cell_w)
+                plot_px_h = max(50, plot_char_rows * cell_h)
+
+                # Fetch data at pixel resolution
+                nbins = min(span, plot_px_w)
+                try:
+                    vals = self._get_values_exact(chrom, start, end, nbins=nbins)
+                except:
+                    vals = np.zeros(nbins)
+
+                data_max = np.max(vals) if len(vals) > 0 else 0
+                data_min = np.min(vals) if len(vals) > 0 else 0
+                vmean = np.mean(vals) if len(vals) > 0 else 0
+                nz_frac = np.sum(vals > 0) / max(1, len(vals)) * 100
+                bp_px = span / max(1, plot_px_w)
+
+                # Y-axis limits (user-set or auto)
+                disp_ymin = self.ymin if self.ymin is not None else min(0, data_min)
+                disp_ymax = self.ymax if self.ymax is not None else data_max
+                if disp_ymax <= disp_ymin:
+                    disp_ymax = disp_ymin + 1
+
+                # Render pixel array
+                pixels = self._render_signal_pixels(vals, plot_px_w, plot_px_h,
+                                                    ymin=disp_ymin, ymax=disp_ymax)
+                sixel = self._encode_sixel(pixels)
+
+                # Draw screen (synchronized output prevents flashing)
+                w('\033[?2026h')
+                w('\033[2J\033[H')
+
+                BO = '\033[1m'
+                DM = '\033[2m'
+                RS = '\033[0m'
+
+                # Header (rows 1-2)
+                header = f" {chrom}:{format_pos(start)}-{format_pos(end)}  ({format_bp(span)})"
+                res_str = f"{bp_px:.1f} bp/px" if bp_px >= 1 else f"{1/bp_px:.0f} px/bp"
+                nan_tag = "" if self.nan_zero else " [nanmean]"
+                ylim_tag = "" if (self.ymin is None and self.ymax is None) else " [ylim]"
+                stats_line = (f" max={data_max:.2f}  mean={vmean:.2f}  "
+                              f"cov={nz_frac:.0f}%  [{res_str}]  "
+                              f"[{plot_px_w}\u00d7{plot_px_h}px]{nan_tag}{ylim_tag}")
+                w(f'{BO}{header}{RS}\r\n')
+                w(f'{DM}{stats_line}{RS}\r\n')
+
+                # Sixel image indented to leave room for y-axis labels
+                img_top = 3  # row where image starts (1-indexed)
+                w(f'\033[{y_margin}C')  # indent
+                w(sixel)
+
+                # Y-axis labels overlaid at left margin
+                sixel_rows = (plot_px_h + cell_h - 1) // cell_h
+                w(f'\033[{img_top};1H{DM}{disp_ymax:>5.2f}{RS}')
+                mid_row = img_top + sixel_rows // 2
+                mid_val = (disp_ymin + disp_ymax) / 2
+                w(f'\033[{mid_row};1H{DM}{mid_val:>5.2f}{RS}')
+                w(f'\033[{img_top + sixel_rows - 1};1H{DM}{disp_ymin:>5.2f}{RS}')
+
+                # Move below sixel for x-axis labels
+                after_row = img_top + sixel_rows
+                w(f'\033[{after_row};1H')
+
+                # X-axis labels (indented to match plot)
+                left_l = format_pos(start)
+                right_l = format_pos(end)
+                mid_l = format_pos((start + end) // 2)
+                avail = t_cols - y_margin - len(left_l) - len(right_l)
+                label_pad = ' ' * y_margin
+                w(f'{DM}{label_pad}{left_l}')
+                if avail > len(mid_l) + 4:
+                    half = avail // 2
+                    w(' ' * (half - len(mid_l) // 2) + mid_l)
+                    w(' ' * (avail - half - len(mid_l) + len(mid_l) // 2) + right_l)
+                else:
+                    w(' ' * max(1, avail) + right_l)
+                w(f'{RS}\r\n')
+
+                # Help / status
+                if status_msg:
+                    w(f' {BO}{status_msg}{RS}')
+                else:
+                    w(f' {DM}\u2190/\u2192:pan  \u2191/\u2193:zoom  '
+                      f'1-8:presets  g:goto  c:chrom  n:nan  y:ylim  t:theme  s:stats  q:quit{RS}')
+                w('\033[?2026l')
+                sys.stdout.flush()
+                status_msg = ''
+
+                # Read keypress
+                key = self._read_key(fd)
+
+                if key == 'q' or key == 'ESC':
+                    break
+                elif key == 'LEFT' or key == 'h':
+                    shift = max(1, span // 4)
+                    start -= shift; end -= shift
+                elif key == 'RIGHT' or key == 'l':
+                    shift = max(1, span // 4)
+                    start += shift; end += shift
+                elif key == 'H':
+                    shift = max(1, span // 2)
+                    start -= shift; end -= shift
+                elif key == 'L':
+                    shift = max(1, span // 2)
+                    start += shift; end += shift
+                elif key == 'UP' or key == 'k' or key == '+':
+                    center = (start + end) // 2
+                    new_span = max(20, span // 2)
+                    start = center - new_span // 2
+                    end = start + new_span
+                elif key == 'DOWN' or key == 'j' or key == '-':
+                    center = (start + end) // 2
+                    new_span = min(size, span * 2)
+                    start = center - new_span // 2
+                    end = start + new_span
+                elif key in '12345678':
+                    idx = int(key) - 1
+                    center = (start + end) // 2
+                    new_span = ZOOM_PRESETS[idx]
+                    start = center - new_span // 2
+                    end = start + new_span
+                elif key == 's':
+                    try:
+                        sv = self._get_values(chrom, start, end)
+                        nz = sv[sv > 0]
+                        if len(nz) > 0:
+                            status_msg = (
+                                f"min={np.min(sv):.3g}  max={np.max(sv):.3g}  "
+                                f"mean={np.mean(sv):.3g}  std={np.std(sv):.3g}  "
+                                f"median={np.median(sv):.3g}  "
+                                f"cov={len(nz)/len(sv)*100:.0f}%")
+                        else:
+                            status_msg = "No signal"
+                    except:
+                        status_msg = "Stats error"
+                elif key == 'n':
+                    self.nan_zero = not self.nan_zero
+                    status_msg = "nan=0 (mean)" if self.nan_zero else "skip NaN (nanmean)"
+                elif key == 't':
+                    self.dark_bg = not self.dark_bg
+                    status_msg = "dark theme" if self.dark_bg else "light theme"
+                elif key == 'y':
+                    w('\r\n ylim (ymax or ymin ymax or auto): ')
+                    w('\033[?25h')
+                    sys.stdout.flush()
+                    result = self._read_line_esc(fd)
+                    w('\033[?25l')
+                    sys.stdout.flush()
+                    if result is not None:
+                        r = result.strip()
+                        if r.lower() == 'auto' or r == '':
+                            self.ymin = None
+                            self.ymax = None
+                            status_msg = "ylim: auto"
+                        else:
+                            parts = r.split()
+                            try:
+                                if len(parts) == 1:
+                                    self.ymin = 0
+                                    self.ymax = float(parts[0])
+                                else:
+                                    self.ymin = float(parts[0])
+                                    self.ymax = float(parts[1])
+                                status_msg = f"ylim: [{self.ymin:.4g}, {self.ymax:.4g}]"
+                            except ValueError:
+                                status_msg = f"Invalid: {r}"
+                elif key == 'g':
+                    w('\r\n Goto: ')
+                    w('\033[?25h')
+                    sys.stdout.flush()
+                    result = self._read_line_esc(fd)
+                    w('\033[?25l')
+                    sys.stdout.flush()
+                    if result:
+                        c, s, e = parse_region(result, chrom, self.chroms)
+                        if c and c in self.chroms:
+                            chrom, start, end = c, s, e
+                        else:
+                            status_msg = f"Invalid: {result}"
+                elif key == 'c':
+                    w('\r\n Chrom: ')
+                    w('\033[?25h')
+                    sys.stdout.flush()
+                    result = self._read_line_esc(fd)
+                    w('\033[?25l')
+                    sys.stdout.flush()
+                    if result:
+                        matched = result.strip()
+                        if matched not in self.chroms:
+                            for cn in self.chroms:
+                                if cn.lower() == matched.lower():
+                                    matched = cn
+                                    break
+                        if matched in self.chroms:
+                            chrom = matched
+                            start, end = 0, self.chroms[matched]
+                        else:
+                            status_msg = f"Unknown: {result}"
+
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            w('\033[?25h')   # show cursor
+            w('\033[2J\033[H')  # clear
+            sys.stdout.flush()
+
+        self._set_region(chrom, start, end)
+
+    # ── Metadata ─────────────────────────────────────────────
+
+    def do_info(self, arg):
+        """File and chromosome info.  Usage: info [chrom]"""
+        if arg.strip() and arg.strip() in self.chroms:
+            chrom = arg.strip()
+            size = self.chroms[chrom]
+            # Get stats for the whole chrom
+            st = self.bw.stats(chrom, 0, size, type="mean", nBins=1)
+            st_max = self.bw.stats(chrom, 0, size, type="max", nBins=1)
+            st_min = self.bw.stats(chrom, 0, size, type="min", nBins=1)
+            cov = self.bw.stats(chrom, 0, size, type="coverage", nBins=1)
+
+            mean_val = st[0] if st[0] is not None else 0
+            max_val = st_max[0] if st_max[0] is not None else 0
+            min_val = st_min[0] if st_min[0] is not None else 0
+            cov_val = cov[0] if cov[0] is not None else 0
+
+            print(f"  {C.BOLD}Chromosome:{C.RESET} {chrom}")
+            print(f"  {C.BOLD}Size:{C.RESET}       {format_bp(size)} ({size:,} bp)")
+            print(f"  {C.BOLD}Min:{C.RESET}        {min_val:.4f}")
+            print(f"  {C.BOLD}Max:{C.RESET}        {max_val:.4f}")
+            print(f"  {C.BOLD}Mean:{C.RESET}       {mean_val:.4f}")
+            print(f"  {C.BOLD}Coverage:{C.RESET}   {cov_val * 100:.1f}%")
+            return
+
+        # File-level info
+        fsize = format_size(os.path.getsize(self.filename))
+        total_bp = sum(self.chroms.values())
+        n_main = sum(1 for c in self.chroms if not '_' in c or c.startswith('chr'))
+
+        header = self.bw.header()
+
+        print(f"  {C.BOLD}File:{C.RESET}        {self.filename}")
+        print(f"  {C.BOLD}Size:{C.RESET}        {fsize}")
+        print(f"  {C.BOLD}Chromosomes:{C.RESET} {len(self.chroms)} ({n_main} main)")
+        print(f"  {C.BOLD}Total span:{C.RESET}  {format_bp(total_bp)}")
+        if header:
+            if 'nBasesCovered' in header:
+                covered = header['nBasesCovered']
+                pct = 100 * covered / total_bp if total_bp > 0 else 0
+                print(f"  {C.BOLD}Bases covered:{C.RESET} {covered:,} ({pct:.1f}%)")
+            if 'minVal' in header:
+                print(f"  {C.BOLD}Value range:{C.RESET}  [{header['minVal']:.4f}, {header['maxVal']:.4f}]")
+            if 'sumData' in header and 'nBasesCovered' in header and header['nBasesCovered'] > 0:
+                mean = header['sumData'] / header['nBasesCovered']
+                print(f"  {C.BOLD}Mean (covered):{C.RESET} {mean:.4f}")
+            if 'sumSquared' in header and 'nBasesCovered' in header and header['nBasesCovered'] > 0:
+                n = header['nBasesCovered']
+                var = header['sumSquared'] / n - (header['sumData'] / n) ** 2
+                if var > 0:
+                    print(f"  {C.BOLD}Std (covered):{C.RESET}  {math.sqrt(var):.4f}")
+
+    complete_info = _complete_chrom
+
+    def do_ylim(self, arg):
+        """Set y-axis limits.  Usage: ylim [ymin ymax | ymax | auto]
+
+        Examples:
+            ylim 0 5        Fix y-axis to 0-5
+            ylim 5          Fix ymax to 5, ymin to 0
+            ylim -2 5       Fix y-axis to -2 to 5
+            ylim auto       Reset to auto-scaling (default)
+            ylim            Show current setting
+        """
+        arg = arg.strip()
+        if not arg:
+            ymin_s = "auto" if self.ymin is None else f"{self.ymin:.4g}"
+            ymax_s = "auto" if self.ymax is None else f"{self.ymax:.4g}"
+            print(f"  ylim: [{ymin_s}, {ymax_s}]")
+            return
+        if arg.lower() == 'auto':
+            self.ymin = None
+            self.ymax = None
+            print(f"  ylim: {C.BOLD}auto{C.RESET}")
+            return
+        parts = arg.split()
+        try:
+            if len(parts) == 1:
+                self.ymin = 0
+                self.ymax = float(parts[0])
+            else:
+                self.ymin = float(parts[0])
+                self.ymax = float(parts[1])
+            print(f"  ylim: {C.BOLD}[{self.ymin:.4g}, {self.ymax:.4g}]{C.RESET}")
+        except ValueError:
+            print(f"  Invalid: {arg}. Use 'ylim ymin ymax' or 'ylim auto'")
+
+    def do_nanmode(self, arg):
+        """Toggle NaN handling.  Usage: nanmode [on|off]
+
+        on  = treat missing/NaN as zero (mean, default)
+        off = ignore missing positions  (nanmean)
+        """
+        arg = arg.strip().lower()
+        if arg == 'on':
+            self.nan_zero = True
+        elif arg == 'off':
+            self.nan_zero = False
+        else:
+            self.nan_zero = not self.nan_zero
+        mode = "nan=0 (mean)" if self.nan_zero else "skip NaN (nanmean)"
+        print(f"  NaN mode: {C.BOLD}{mode}{C.RESET}")
+
+    def do_stats(self, arg):
+        """Region statistics.  Usage: stats <region>
+
+        Examples:
+            stats chr1:1000-2000
+            stats chr1              (whole chromosome)
+        """
+        chrom, start, end = self._parse(arg)
+        if chrom is None:
+            print(f"{C.RED}Cannot parse region. Usage: stats chr1:1000-2000{C.RESET}")
+            return
+        if chrom not in self.chroms:
+            print(f"{C.RED}Unknown chromosome: {chrom}{C.RESET}")
+            return
+
+        size = self.chroms[chrom]
+        start = max(0, start)
+        end = min(size, end)
+        span = end - start
+
+        self._set_region(chrom, start, end)
+
+        # Use binned stats for large regions, per-base for small
+        if span <= 1_000_000:
+            vals = np.nan_to_num(
+                np.array(self.bw.values(chrom, start, end), dtype=np.float64), nan=0.0)
+        else:
+            nbins = min(span, 100_000)
+            vals = self._get_values_exact(chrom, start, end, nbins=nbins)
+
+        nonzero = vals[vals > 0]
+        coverage = len(nonzero) / len(vals) * 100 if len(vals) > 0 else 0
+
+        print(f"  {C.BOLD}Region:{C.RESET}    {chrom}:{format_pos(start)}-{format_pos(end)}"
+              f" ({format_bp(span)})")
+        print(f"  {C.BOLD}Min:{C.RESET}       {np.min(vals):.6g}")
+        print(f"  {C.BOLD}Max:{C.RESET}       {np.max(vals):.6g}")
+        print(f"  {C.BOLD}Mean:{C.RESET}      {np.mean(vals):.6g}")
+        print(f"  {C.BOLD}Std:{C.RESET}       {np.std(vals):.6g}")
+        if len(nonzero) > 0:
+            print(f"  {C.BOLD}Mean (nz):{C.RESET} {np.mean(nonzero):.6g}")
+        print(f"  {C.BOLD}Median:{C.RESET}    {np.median(vals):.6g}")
+        pcts = np.percentile(vals, [1, 25, 75, 99])
+        print(f"  {C.BOLD}P1/P25/P75/P99:{C.RESET} {pcts[0]:.4g} / {pcts[1]:.4g} / "
+              f"{pcts[2]:.4g} / {pcts[3]:.4g}")
+        print(f"  {C.BOLD}Coverage:{C.RESET}  {coverage:.1f}%")
+        print(f"  {C.BOLD}Sum:{C.RESET}       {np.sum(vals):.6g}")
+
+    complete_stats = _complete_chrom
+
+    # ── Analysis ─────────────────────────────────────────────
+
+    def do_hist(self, arg):
+        """Text histogram of signal values.  Usage: hist [-b BINS] <region>"""
+        parts = arg.split()
+        bins = 20
+        i = 0
+        remaining = []
+        while i < len(parts):
+            if parts[i] == '-b' and i + 1 < len(parts):
+                bins = int(parts[i + 1])
+                i += 2
+            else:
+                remaining.append(parts[i])
+                i += 1
+
+        region_arg = ' '.join(remaining)
+        chrom, start, end = self._parse(region_arg)
+        if chrom is None:
+            print(f"{C.RED}Cannot parse region. Usage: hist chr1:1000-2000{C.RESET}")
+            return
+
+        size = self.chroms.get(chrom, 0)
+        start = max(0, start)
+        end = min(size, end)
+        span = end - start
+
+        vals = self._get_values(chrom, start, end)
+        # Optionally exclude zeros for cleaner histogram
+        nonzero = vals[vals > 0]
+        if len(nonzero) == 0:
+            print("  (all zeros)")
+            return
+
+        zero_frac = (len(vals) - len(nonzero)) / len(vals) * 100
+
+        counts, edges = np.histogram(nonzero, bins=bins)
+        max_count = max(counts)
+        tw = shutil.get_terminal_size((80, 24)).columns
+        bar_width = max(10, min(40, tw - 35))
+
+        print(f"  {C.DIM}(zeros: {zero_frac:.1f}% of {len(vals):,} bins, "
+              f"histogram of non-zero values){C.RESET}")
+
+        for i in range(len(counts)):
+            lo, hi = edges[i], edges[i + 1]
+            bar_len = int(counts[i] / max_count * bar_width) if max_count > 0 else 0
+            bar = '\u2588' * bar_len
+            pct = 100 * counts[i] / len(nonzero)
+            print(f"  [{lo:>9.3g},{hi:>9.3g})"
+                  f" {C.GREEN}{bar}{C.RESET} {counts[i]:>7,} ({pct:4.1f}%)")
+
+    complete_hist = _complete_chrom
+
+    def do_max(self, arg):
+        """Find position of maximum signal.  Usage: max [chrom|region]"""
+        chrom, start, end = self._parse(arg)
+        if chrom is None:
+            if self.chrom:
+                chrom = self.chrom
+                start, end = 0, self.chroms[chrom]
+            else:
+                print("No chromosome selected. Usage: max <chrom>")
+                return
+
+        size = self.chroms.get(chrom, 0)
+        start = max(0, start)
+        end = min(size, end)
+        span = end - start
+
+        # Binary search for max position using binned stats
+        # Start with coarse bins, then narrow down
+        current_start, current_end = start, end
+
+        for _ in range(20):  # max iterations
+            if current_end - current_start <= 100:
+                break
+            nbins = min(current_end - current_start, 1000)
+            stats = self.bw.stats(chrom, current_start, current_end,
+                                  type="max", nBins=nbins)
+            stats = [x if x is not None else 0 for x in stats]
+            max_bin = np.argmax(stats)
+            bin_size = (current_end - current_start) / nbins
+            current_start = max(start, int(current_start + max_bin * bin_size - bin_size))
+            current_end = min(end, int(current_start + 3 * bin_size))
+
+        # Get exact values in narrowed region
+        vals = self.bw.values(chrom, current_start, current_end)
+        vals = np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+        max_idx = np.argmax(vals)
+        max_pos = current_start + max_idx
+        max_val = vals[max_idx]
+
+        print(f"  {C.BOLD}Max:{C.RESET} {max_val:.6f} at {C.GREEN}{chrom}:{format_pos(max_pos)}{C.RESET}")
+
+        # Show context
+        ctx = 500
+        ctx_start = max(0, max_pos - ctx)
+        ctx_end = min(size, max_pos + ctx)
+        print(f"  {C.DIM}View context: view {chrom}:{ctx_start}-{ctx_end}{C.RESET}")
+
+    complete_max = _complete_chrom
+
+    def do_bed(self, arg):
+        """Show signal stats for regions in a BED file.  Usage: bed <file.bed> [-v]
+        -v  show sparkline for each region"""
+        parts = arg.split()
+        show_view = '-v' in parts
+        if '-v' in parts:
+            parts.remove('-v')
+        if not parts:
+            print("Usage: bed <file.bed> [-v]")
+            return
+
+        bedfile = os.path.expanduser(parts[0])
+        if not os.path.isfile(bedfile):
+            print(f"{C.RED}File not found: {bedfile}{C.RESET}")
+            return
+
+        with open(bedfile) as f:
+            regions = []
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or line.startswith('track'):
+                    continue
+                fields = line.split('\t')
+                if len(fields) < 3:
+                    continue
+                chrom = fields[0]
+                start = int(fields[1])
+                end = int(fields[2])
+                name = fields[3] if len(fields) > 3 else ''
+                regions.append((chrom, start, end, name))
+
+        if not regions:
+            print("  No regions found in BED file.")
+            return
+
+        print(f"  {C.DIM}{len(regions)} regions from {os.path.basename(bedfile)}{C.RESET}\n")
+
+        for chrom, start, end, name in regions[:100]:
+            if chrom not in self.chroms:
+                continue
+
+            span = end - start
+            st = self.bw.stats(chrom, start, end, type="mean", nBins=1)
+            st_max = self.bw.stats(chrom, start, end, type="max", nBins=1)
+
+            mean_val = st[0] if st and st[0] is not None else 0
+            max_val = st_max[0] if st_max and st_max[0] is not None else 0
+
+            label = f"{name:>15} " if name else ""
+            print(f"  {label}{C.GREEN}{chrom}:{format_pos(start)}-{format_pos(end)}{C.RESET}"
+                  f"  {format_bp(span):>10}"
+                  f"  mean={mean_val:>8.3f}  max={max_val:>8.3f}")
+
+            if show_view:
+                nbins = min(span, 60)
+                vals = self._get_values_exact(chrom, start, end, nbins=nbins)
+                print(f"  {'':>15} {C.DIM}{sparkline(vals, width=60)}{C.RESET}")
+
+        if len(regions) > 100:
+            print(f"\n  {C.YELLOW}... showing first 100 of {len(regions)} regions{C.RESET}")
+
+    # ── Export ───────────────────────────────────────────────
+
+    def do_export(self, arg):
+        """Export region to file.  Usage: export <region> <out.npy|.bedgraph|.tsv>"""
+        parts = arg.rsplit(None, 1)
+        if len(parts) < 2:
+            print("Usage: export <region> <output.npy|.bedgraph|.tsv>")
+            return
+
+        region_arg, outfile = parts
+        chrom, start, end = self._parse(region_arg)
+        if chrom is None:
+            print(f"{C.RED}Cannot parse region.{C.RESET}")
+            return
+
+        size = self.chroms.get(chrom, 0)
+        start = max(0, start)
+        end = min(size, end)
+
+        vals = self.bw.values(chrom, start, end)
+        vals = np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+
+        outfile = os.path.expanduser(outfile)
+        if outfile.endswith('.npy'):
+            np.save(outfile, vals)
+        elif outfile.endswith('.bedgraph') or outfile.endswith('.bg'):
+            with open(outfile, 'w') as f:
+                for i, v in enumerate(vals):
+                    if v != 0:
+                        f.write(f"{chrom}\t{start + i}\t{start + i + 1}\t{v:.6f}\n")
+        elif outfile.endswith('.tsv') or outfile.endswith('.txt'):
+            with open(outfile, 'w') as f:
+                f.write("chrom\tpos\tvalue\n")
+                for i, v in enumerate(vals):
+                    f.write(f"{chrom}\t{start + i}\t{v:.6f}\n")
+        else:
+            print(f"{C.RED}Unknown format. Use .npy, .bedgraph, or .tsv{C.RESET}")
+            return
+
+        print(f"  Saved {len(vals):,} values -> {outfile}")
+
+    # ── Help ─────────────────────────────────────────────────
+
+    def do_help(self, arg):
+        """Show help.  Usage: help [command]"""
+        if arg:
+            func = getattr(self, 'do_' + arg, None)
+            if func and func.__doc__:
+                print()
+                print(func.__doc__)
+                print()
+            else:
+                print(f"  Unknown command: {arg}")
+            return
+
+        print(f"""
+{C.BOLD}Navigation{C.RESET}
+  {C.GREEN}chroms{C.RESET} [-a]              List chromosomes with sizes (-a = show all)
+  {C.GREEN}cd{C.RESET} <chrom>               Set current chromosome
+  {C.GREEN}pwd{C.RESET}                      Current chromosome / last viewed region
+
+{C.BOLD}Interactive Browser{C.RESET}  {C.DIM}(full-screen genome browser with keyboard navigation){C.RESET}
+  {C.GREEN}browse{C.RESET} [region]            Launch interactive browser (alias: {C.GREEN}b{C.RESET}, {C.GREEN}bp{C.RESET})
+  {C.DIM}  Sixel pixel rendering \u2014 requires sixel terminal (iTerm2, WezTerm, foot, xterm)
+  \u2190/\u2192 h/l pan  \u2191/\u2193 k/j zoom  1-8 presets  g goto  c chrom  n nan  y ylim  t theme  s stats  q quit{C.RESET}
+  {C.GREEN}bc{C.RESET} [region]                Text-mode browser (curses fallback, no sixel needed)
+  {C.DIM}  Same keys + r to cycle render modes (half-block | block | braille){C.RESET}
+
+{C.BOLD}Visualization{C.RESET}  {C.DIM}(regions: chr1:1000-2000 | 1000-2000 | chr1:1m-1.1m){C.RESET}
+  {C.GREEN}view{C.RESET} <region> [-h N]      ASCII signal plot (N = plot height)
+  {C.GREEN}peek{C.RESET} [chrom]              Whole-chromosome sparkline overview
+  {C.GREEN}cat{C.RESET} <region>              Raw per-base values
+  {C.GREEN}head{C.RESET} [-n N] [chrom]       First N bp of signal (default 20)
+  {C.GREEN}tail{C.RESET} [-n N] [chrom]       Last N bp of signal
+
+{C.BOLD}Pan & Zoom{C.RESET}  {C.DIM}(after 'view', navigate without retyping coordinates){C.RESET}
+  {C.GREEN}left{C.RESET} / {C.GREEN}right{C.RESET}              Pan 25% of current view
+  {C.GREEN}zoomin{C.RESET} / {C.GREEN}zi{C.RESET}               Zoom in 2x
+  {C.GREEN}zoomout{C.RESET} / {C.GREEN}zo{C.RESET}              Zoom out 2x
+
+{C.BOLD}Metadata & Stats{C.RESET}
+  {C.GREEN}info{C.RESET} [chrom]              File or chromosome summary
+  {C.GREEN}stats{C.RESET} <region>            Min/max/mean/std/median/percentiles/coverage
+  {C.GREEN}nanmode{C.RESET} [on|off]          Toggle NaN=0 (on=mean, off=nanmean; default: on)
+  {C.DIM}  In browse/bp: press {C.GREEN}n{C.DIM} to toggle{C.RESET}
+  {C.GREEN}ylim{C.RESET} [ymin ymax | auto]    Set y-axis limits (default: auto)
+  {C.DIM}  In browse/bp: press {C.GREEN}y{C.DIM} to set{C.RESET}
+
+{C.BOLD}Analysis{C.RESET}
+  {C.GREEN}hist{C.RESET} [-b N] <region>      Histogram of signal values
+  {C.GREEN}max{C.RESET} [chrom|region]        Find position of maximum signal
+  {C.GREEN}bed{C.RESET} <file.bed> [-v]       Stats for BED regions (-v = sparklines)
+
+{C.BOLD}Export{C.RESET}
+  {C.GREEN}export{C.RESET} <region> <file>    Save to .npy / .bedgraph / .tsv
+
+{C.BOLD}Tips{C.RESET}
+  {C.DIM}Coordinates support commas (1,000) and suffixes (1k, 1.5m).
+  Type a chromosome name to cd into it.
+  Use 'browse' (or 'b') for interactive pixel-mode navigation (sixel).
+  Use 'bc' for text-mode fallback if your terminal lacks sixel support.
+  Tab completion works for chromosome names.{C.RESET}
+""")
+
+    # ── Utility ──────────────────────────────────────────────
+
+    def do_exit(self, arg):
+        """Exit bwsh."""
+        return True
+
+    def do_quit(self, arg):
+        """Exit bwsh."""
+        return True
+
+    def do_q(self, arg):
+        """Exit bwsh."""
+        return True
+
+    def do_EOF(self, arg):
+        print()
+        return True
+
+    def emptyline(self):
+        pass
+
+    def default(self, line):
+        """Smart default: chromosome name -> cd, anything with : -> view."""
+        name = line.strip()
+        if not name:
+            return
+
+        # If it's a chromosome name, cd
+        if name in self.chroms:
+            self.do_cd(name)
+            return
+
+        # Case-insensitive
+        for c in self.chroms:
+            if c.lower() == name.lower():
+                self.do_cd(c)
+                return
+
+        # If it looks like a region, view it
+        if ':' in name or (self.chrom and re.match(r'^\d', name)):
+            self.do_view(name)
+            return
+
+        print(f"Unknown command: {line}. Type 'help' for commands.")
+
+    def postcmd(self, stop, line):
+        return stop
+
+    def close(self):
+        self.bw.close()
+
+
+# ── Entry point ──────────────────────────────────────────────
+
+def main():
+    import argparse
+    import textwrap
+    parser = argparse.ArgumentParser(
+        description='bwsh - Interactive bigWig file explorer',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Interactive commands:
+              chroms [-a]              list chromosomes
+              cd <chrom>               set current chromosome
+              view <region> [-h N]     ASCII signal plot
+              peek [chrom]             whole-chromosome overview
+              cat <region>             raw per-base values
+              left/right/zi/zo         pan and zoom after view
+              stats <region>           signal statistics
+              hist <region>            signal histogram
+              max [chrom]              find position of max signal
+              bed <file.bed> [-v]      stats for BED regions
+              export <region> <file>   save to npy/bedgraph/tsv
+
+            Region formats:
+              chr1:1000-2000   chr1:1,000-2,000   chr1:1k-2k
+              chr1:1m-1.1m     1000-2000 (if cd'd)
+        """),
+    )
+    parser.add_argument('file', help='bigWig file to open')
+    parser.add_argument('--no-color', action='store_true', help='Disable colors')
+    parser.add_argument('-c', '--command', help='Run command and exit')
+    parser.add_argument('--chroms', action='store_true', help='List chromosomes and exit')
+
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.file):
+        print(f"Error: {args.file}: No such file", file=sys.stderr)
+        sys.exit(1)
+
+    shell = BWShell(args.file, no_color=args.no_color)
+
+    try:
+        if args.chroms:
+            shell.do_chroms('')
+        elif args.command:
+            for cmd_line in args.command.split(';'):
+                shell.onecmd(cmd_line.strip())
+        else:
+            shell.cmdloop()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+    finally:
+        shell.close()
+
+
+if __name__ == '__main__':
+    main()
