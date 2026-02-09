@@ -4,13 +4,20 @@ Interactive terminal tools for exploring scientific data files. Navigate, visual
 
 ## Tools
 
-### h5sh - HDF5 Explorer
+### ash - Array Shell
 
-An interactive shell for HDF5 files. Navigate groups like a filesystem, slice arrays with numpy syntax, and visualize datasets with built-in plotting and an interactive browser.
+An interactive shell for array data files. Supports HDF5, NumPy `.npy`, and `.npz` files. Navigate groups like a filesystem, slice arrays with numpy syntax, and visualize datasets with built-in plotting and an interactive browser.
 
 ```
-h5sh data.h5
+ash data.h5
+ash weights.npy
+ash archive.npz
 ```
+
+**Supported formats:**
+- **HDF5** (`.h5`, `.hdf5`, `.hdf`) — full group/dataset hierarchy
+- **NPY** (`.npy`) — single array, exposed as `data` dataset
+- **NPZ** (`.npz`) — multiple arrays, each as a dataset in the root group
 
 **Features:**
 - Filesystem-style navigation (`ls`, `cd`, `tree`, `pwd`) with tab completion
@@ -22,9 +29,11 @@ h5sh data.h5
 - Disk usage (`du`) and regex search (`find`)
 - Export to `.npy`, `.csv`, `.tsv`
 
-The interactive browser renders pixel-level graphics via sixel protocol (with automatic curses text-mode fallback). 2D datasets are displayed as viridis heatmaps. Only the visible portion of data is loaded per frame via h5py stride slicing, so browsing stays responsive on arbitrarily large arrays.
+The interactive browser renders pixel-level graphics via sixel protocol (with automatic curses text-mode fallback). 2D datasets are displayed as viridis heatmaps. Only the visible portion of data is loaded per frame via stride slicing, so browsing stays responsive on arbitrarily large arrays.
 
-<!-- ![h5sh 2D heatmap browser](screenshots/h5sh_heatmap.png) -->
+`h5sh` is provided as a backwards-compatible alias for `ash`.
+
+<!-- ![ash 2D heatmap browser](screenshots/h5sh_heatmap.png) -->
 
 ### bwsh - BigWig Explorer
 
@@ -53,10 +62,12 @@ Both tools are standalone Python scripts with minimal dependencies.
 **Requirements:** Python 3.7+, numpy
 
 ```bash
-# h5sh
-pip install h5py numpy
-cp h5sh ~/bin/
-chmod +x ~/bin/h5sh
+# ash (array shell — HDF5, npy, npz)
+pip install numpy        # h5py optional, needed only for HDF5 files
+pip install h5py         # if you work with HDF5
+cp ash ~/bin/
+chmod +x ~/bin/ash
+ln -s ash ~/bin/h5sh     # optional backwards-compatible alias
 
 # bwsh
 pip install pyBigWig numpy
@@ -68,7 +79,7 @@ chmod +x ~/bin/bwsh
 
 ## Quick Reference
 
-### h5sh
+### ash
 
 | Command | Description |
 |---------|-------------|
@@ -106,7 +117,7 @@ chmod +x ~/bin/bwsh
 | `h`/`l`, Left/Right | Pan 25% |
 | `H`/`L` | Pan 50% |
 | `k`/`j` | Zoom in/out |
-| Up/Down | Scroll rows (h5sh 2D) / Zoom (bwsh) |
+| Up/Down | Scroll rows (ash 2D) / Zoom (bwsh) |
 | `1`-`8` | Zoom presets |
 | `g` | Goto position |
 | `s` | Stats |
