@@ -23,6 +23,7 @@ import tty
 import select
 import fcntl
 import struct
+import signal
 
 try:
     import pyBigWig
@@ -35,6 +36,45 @@ try:
 except ImportError:
     print("bwsh requires numpy: pip install numpy", file=sys.stderr)
     sys.exit(1)
+
+
+# ── Track wrapper ────────────────────────────────────────────
+
+class Track:
+    """One bigWig data source."""
+    __slots__ = ('bw', 'filename', 'basename', 'chroms', 'index')
+
+    def __init__(self, filename, index):
+        self.filename = os.path.abspath(filename)
+        self.basename = os.path.basename(filename)
+        self.bw = pyBigWig.open(filename)
+        self.chroms = self.bw.chroms()
+        self.index = index
+
+    def stats(self, chrom, start, end, **kw):
+        if chrom not in self.chroms:
+            return [0.0] * kw.get('nBins', 1)
+        return self.bw.stats(chrom, start, end, **kw)
+
+    def values(self, chrom, start, end):
+        if chrom not in self.chroms:
+            return [0.0] * (end - start)
+        return self.bw.values(chrom, start, end)
+
+    def close(self):
+        self.bw.close()
+
+
+def _union_chroms(tracks):
+    """Union of all track chromosome dicts (max size on mismatch)."""
+    merged = {}
+    for t in tracks:
+        for name, size in t.chroms.items():
+            if name in merged:
+                merged[name] = max(merged[name], size)
+            else:
+                merged[name] = size
+    return merged
 
 
 # ── ANSI colors ─────────────────────────────────────────────
@@ -55,6 +95,24 @@ class C:
         for attr in ('BLUE', 'CYAN', 'GREEN', 'YELLOW', 'RED',
                       'MAGENTA', 'DIM', 'BOLD', 'RESET'):
             setattr(cls, attr, '')
+
+
+# ── Track colors ─────────────────────────────────────────────
+
+TRACK_ANSI = [C.GREEN, C.CYAN, C.YELLOW, C.MAGENTA, C.RED, C.BLUE]
+# Sixel RGB% per track: (dark_bg, light_bg)
+TRACK_SIXEL = [
+    ((45, 85, 45),  (15, 55, 15)),   # green
+    ((40, 80, 90),  (10, 50, 65)),   # teal
+    ((90, 75, 30),  (65, 50, 5)),    # amber
+    ((75, 45, 80),  (55, 20, 60)),   # purple
+    ((90, 45, 40),  (70, 20, 15)),   # red
+    ((45, 55, 90),  (15, 25, 65)),   # blue
+]
+TRACK_CURSES_COLORS = [
+    curses.COLOR_GREEN, curses.COLOR_CYAN, curses.COLOR_YELLOW,
+    curses.COLOR_MAGENTA, curses.COLOR_RED, curses.COLOR_BLUE,
+]
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -175,8 +233,8 @@ def sparkline(values, width=None):
     return ''.join(BLOCKS[min(8, max(0, int(v * 8)))] for v in norm)
 
 
-def signal_plot(values, height=15, width=None):
-    """Multi-row signal plot with axis labels."""
+def signal_plot(values, height=15, width=None, color=None):
+    """Multi-row signal plot with zero-baseline. color: ANSI escape or None."""
     if width is None:
         tw = shutil.get_terminal_size((80, 24)).columns
         width = tw - 12  # leave room for y-axis
@@ -189,37 +247,50 @@ def signal_plot(values, height=15, width=None):
         binned = np.array_split(vals, width)
         vals = np.array([np.mean(b) for b in binned])
 
+    vmin = np.min(vals)
     vmax = np.max(vals)
-    if vmax == 0:
+    ylo = vmin
+    yhi = vmax
+    span = yhi - ylo
+    if span == 0:
         return "  (all zeros in region)"
 
-    # Normalize to height
-    norm = vals / vmax * height
+    # Normalize to height (0 = ylo, height = yhi)
+    norm = (vals - ylo) / span * height
+    zero_h = (0 - ylo) / span * height  # height from bottom where zero is
 
     lines = []
     for row in range(height, 0, -1):
         chars = []
         for v in norm:
-            if v >= row:
+            lo = min(v, zero_h)
+            hi = max(v, zero_h)
+            overlap = max(0.0, min(hi, row) - max(lo, row - 1))
+            if overlap >= 1.0:
                 chars.append('\u2588')
-            elif v > row - 1:
-                frac = v - (row - 1)
-                idx = min(8, max(1, int(frac * 8)))
+            elif overlap > 0:
+                idx = min(8, max(1, int(overlap * 8)))
                 chars.append(BLOCKS[idx])
             else:
                 chars.append(' ')
 
         # Y-axis label
+        y_val = ylo + (row / height) * span
         if row == height:
-            label = f"{vmax:>8.2f} \u2502"
+            label = f"{yhi:>8.3g} \u2502"
         elif row == 1:
+            label = f"{ylo:>8.3g} \u2502"
+        elif abs(row - zero_h) < 0.5 and ylo < 0:
             label = f"{'0':>8} \u2502"
         elif row == (height + 1) // 2:
-            label = f"{vmax / 2:>8.2f} \u2502"
+            label = f"{y_val:>8.3g} \u2502"
         else:
             label = f"{'':>8} \u2502"
 
-        lines.append(label + ''.join(chars))
+        bar = ''.join(chars)
+        if color:
+            bar = color + bar + '\033[0m'
+        lines.append(label + bar)
 
     return '\n'.join(lines)
 
@@ -228,35 +299,57 @@ def signal_plot(values, height=15, width=None):
 
 class BWShell(cmd.Cmd):
 
-    def __init__(self, filename, no_color=False):
+    def __init__(self, filenames, no_color=False):
         super().__init__()
         if no_color or not sys.stdout.isatty():
             C.disable()
 
-        self.filename = os.path.abspath(filename)
-        self.basename = os.path.basename(filename)
-        self.bw = pyBigWig.open(filename)
-        self.chroms = self.bw.chroms()  # {name: size}
-        self.chrom = None                # current chromosome
-        self.region = None               # last viewed (chrom, start, end)
-        self.nan_zero = True             # treat NaN/missing as 0 (True=mean, False=nanmean)
+        if isinstance(filenames, str):
+            filenames = [filenames]
+
+        # ── Multi-track setup ──
+        self.tracks = [Track(fn, i) for i, fn in enumerate(filenames)]
+        self.n_tracks = len(self.tracks)
+
+        # Backward compat aliases (primary track)
+        self.bw = self.tracks[0].bw
+        self.filename = self.tracks[0].filename
+        self.basename = self.tracks[0].basename
+
+        # Union of all chroms
+        self.chroms = _union_chroms(self.tracks)
+
+        self.chrom = None
+        self.region = None
+        self.nan_zero = True
         self.dark_bg = self._detect_dark_bg()
         self.sixel = self._detect_sixel()
-        self.ymin = None               # None = auto (0 or data min)
-        self.ymax = None               # None = auto (data max)
+        self.ymin = [None] * self.n_tracks
+        self.ymax = [None] * self.n_tracks
         self._update_prompt()
 
         readline.set_completer_delims(' \t\n')
 
-        fsize = format_size(os.path.getsize(filename))
         total_bp = sum(self.chroms.values())
-        self.intro = (
-            f"\n{C.BOLD}bwsh{C.RESET} - {C.CYAN}{self.basename}{C.RESET}"
-            f"  ({fsize}, {len(self.chroms)} chroms, {format_bp(total_bp)})\n"
-            f"Type {C.GREEN}help{C.RESET} for commands, "
-            f"{C.GREEN}chroms{C.RESET} to list chromosomes, "
-            f"{C.GREEN}q{C.RESET} to quit.\n"
-        )
+        if self.n_tracks == 1:
+            fsize = format_size(os.path.getsize(filenames[0]))
+            self.intro = (
+                f"\n{C.BOLD}bwsh{C.RESET} - {C.CYAN}{self.basename}{C.RESET}"
+                f"  ({fsize}, {len(self.chroms)} chroms, {format_bp(total_bp)})\n"
+                f"Type {C.GREEN}help{C.RESET} for commands, "
+                f"{C.GREEN}chroms{C.RESET} to list chromosomes, "
+                f"{C.GREEN}q{C.RESET} to quit.\n"
+            )
+        else:
+            tlist = ', '.join(
+                f"{TRACK_ANSI[i % len(TRACK_ANSI)]}{t.basename}{C.RESET}"
+                for i, t in enumerate(self.tracks))
+            self.intro = (
+                f"\n{C.BOLD}bwsh{C.RESET} - {self.n_tracks} tracks: {tlist}\n"
+                f"  ({len(self.chroms)} chroms, {format_bp(total_bp)})\n"
+                f"Type {C.GREEN}help{C.RESET} for commands, "
+                f"{C.GREEN}q{C.RESET} to quit.\n"
+            )
 
     @staticmethod
     def _detect_dark_bg():
@@ -313,35 +406,46 @@ class BWShell(cmd.Cmd):
             return None, None, None
         return parse_region(arg, self.chrom, self.chroms)
 
-    def _apply_nan_zero(self, chrom, start, end, nbins):
-        """Fetch binned mean, optionally scaled by coverage (nan_zero mode)."""
-        means = self.bw.stats(chrom, start, end, type="mean", nBins=nbins)
+    # ── Per-track data fetching ─────────────────────────────
+
+    def _apply_nan_zero_track(self, track, chrom, start, end, nbins):
+        """Fetch binned mean for a track, optionally coverage-scaled."""
+        means = track.stats(chrom, start, end, type="mean", nBins=nbins)
         arr = np.nan_to_num(np.array(means, dtype=np.float64), nan=0.0)
         if self.nan_zero:
-            cov = self.bw.stats(chrom, start, end, type="coverage", nBins=nbins)
+            cov = track.stats(chrom, start, end, type="coverage", nBins=nbins)
             cov_arr = np.nan_to_num(np.array(cov, dtype=np.float64), nan=0.0)
             arr *= cov_arr
         return arr
 
-    def _get_values(self, chrom, start, end):
-        """Get signal values, using stats for large regions, values for small."""
+    def _get_values_track(self, track, chrom, start, end):
+        """Get signal values for a track."""
         span = end - start
         tw = shutil.get_terminal_size((80, 24)).columns
-
         if span <= 10_000:
-            vals = self.bw.values(chrom, start, end)
+            vals = track.values(chrom, start, end)
             return np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
         else:
             nbins = min(span, max(tw * 2, 1000))
-            return self._apply_nan_zero(chrom, start, end, nbins)
+            return self._apply_nan_zero_track(track, chrom, start, end, nbins)
+
+    def _get_values_exact_track(self, track, chrom, start, end, nbins=None):
+        """Get exact binned values for a track."""
+        if nbins:
+            return self._apply_nan_zero_track(track, chrom, start, end, nbins)
+        else:
+            vals = track.values(chrom, start, end)
+            return np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+
+    # Backward-compat wrappers (delegate to primary track)
+    def _apply_nan_zero(self, chrom, start, end, nbins):
+        return self._apply_nan_zero_track(self.tracks[0], chrom, start, end, nbins)
+
+    def _get_values(self, chrom, start, end):
+        return self._get_values_track(self.tracks[0], chrom, start, end)
 
     def _get_values_exact(self, chrom, start, end, nbins=None):
-        """Get exact binned values."""
-        if nbins:
-            return self._apply_nan_zero(chrom, start, end, nbins)
-        else:
-            vals = self.bw.values(chrom, start, end)
-            return np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+        return self._get_values_exact_track(self.tracks[0], chrom, start, end, nbins=nbins)
 
     def _complete_chrom(self, text, line, begidx, endidx):
         """Tab-complete chromosome names."""
@@ -388,7 +492,17 @@ class BWShell(cmd.Cmd):
             bar_len = int(size / max_size * bar_width) if max_size > 0 else 0
             bar = '\u2588' * bar_len
             current = ' *' if name == self.chrom else ''
-            print(f"  {C.GREEN}{name:<{max_name}}{C.RESET}  "
+            # Track presence indicators for multi-track
+            presence = ''
+            if self.n_tracks > 1:
+                for ti, tr in enumerate(self.tracks):
+                    tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                    if name in tr.chroms:
+                        presence += f'{tc}\u2588{C.RESET}'
+                    else:
+                        presence += f'{C.DIM}\u00b7{C.RESET}'
+                presence += ' '
+            print(f"  {presence}{C.GREEN}{name:<{max_name}}{C.RESET}  "
                   f"{format_bp(size):>12}  {C.DIM}{bar}{C.RESET}{C.YELLOW}{current}{C.RESET}")
 
         if hidden:
@@ -477,21 +591,35 @@ class BWShell(cmd.Cmd):
 
         # Get binned values for plotting
         nbins = min(span, plot_width)
-        vals = self._get_values_exact(chrom, start, end, nbins=nbins)
+        per_track_h = max(5, height // self.n_tracks)
 
-        vmax = np.max(vals)
-        vmean = np.mean(vals)
-        nonzero_frac = np.sum(vals > 0) / len(vals) * 100
+        for ti, tr in enumerate(self.tracks):
+            vals = self._get_values_exact_track(tr, chrom, start, end, nbins=nbins)
+            vmax = np.max(vals)
+            vmean = np.mean(vals)
+            nonzero_frac = np.sum(vals > 0) / len(vals) * 100
 
-        print(f"\n  {C.BOLD}{chrom}:{format_pos(start)}-{format_pos(end)}{C.RESET}"
-              f"  ({format_bp(span)})"
-              f"  {C.DIM}max={vmax:.2f}  mean={vmean:.2f}  "
-              f"coverage={nonzero_frac:.0f}%{C.RESET}\n")
+            if self.n_tracks > 1:
+                tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                label = f" {tc}{tr.basename}{C.RESET}"
+            else:
+                label = ""
 
-        if vmax == 0:
-            print(f"  {C.DIM}(no signal in region){C.RESET}")
-        else:
-            print(signal_plot(vals, height=height, width=plot_width))
+            if ti == 0:
+                print(f"\n  {C.BOLD}{chrom}:{format_pos(start)}-{format_pos(end)}{C.RESET}"
+                      f"  ({format_bp(span)}){label}"
+                      f"  {C.DIM}max={vmax:.2f}  mean={vmean:.2f}  "
+                      f"coverage={nonzero_frac:.0f}%{C.RESET}\n")
+            else:
+                print(f"  {label}"
+                      f"  {C.DIM}max={vmax:.2f}  mean={vmean:.2f}  "
+                      f"coverage={nonzero_frac:.0f}%{C.RESET}\n")
+
+            if vmax == 0 and np.min(vals) == 0:
+                print(f"  {C.DIM}(no signal in region){C.RESET}")
+            else:
+                color = TRACK_ANSI[ti % len(TRACK_ANSI)] if self.n_tracks > 1 else None
+                print(signal_plot(vals, height=per_track_h, width=plot_width, color=color))
 
         # X-axis
         axis = f"{'':>8} \u2514" + '\u2500' * min(len(vals), plot_width) + '\u2518'
@@ -540,19 +668,36 @@ class BWShell(cmd.Cmd):
             return
 
         self._set_region(chrom, start, end)
-        vals = self.bw.values(chrom, start, end)
-        vals = np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+
+        # Fetch per-track values
+        all_vals = []
+        for tr in self.tracks:
+            v = tr.values(chrom, start, end)
+            all_vals.append(np.nan_to_num(np.array(v, dtype=np.float64), nan=0.0))
 
         print(f"{C.DIM}{chrom}:{format_pos(start)}-{format_pos(end)} "
               f"({format_bp(span)}){C.RESET}")
 
-        # Print in columnar format: position  value
-        for i, v in enumerate(vals):
+        # Header for multi-track
+        if self.n_tracks > 1:
+            hdr = f"  {'pos':>12}"
+            for tr in self.tracks:
+                hdr += f"  {tr.basename:>12}"
+            print(f"{C.DIM}{hdr}{C.RESET}")
+
+        for i in range(span):
             pos = start + i
-            if v == 0:
-                print(f"  {format_pos(pos):>12}  {C.DIM}{v:.4f}{C.RESET}")
+            line = f"  {format_pos(pos):>12}"
+            all_zero = True
+            for ti in range(self.n_tracks):
+                v = all_vals[ti][i]
+                if v != 0:
+                    all_zero = False
+                line += f"  {v:>12.4f}"
+            if all_zero:
+                print(f"{C.DIM}{line}{C.RESET}")
             else:
-                print(f"  {format_pos(pos):>12}  {v:.4f}")
+                print(line)
 
     complete_cat = _complete_chrom
 
@@ -588,13 +733,24 @@ class BWShell(cmd.Cmd):
         end = min(end, size)
         self._set_region(chrom, start, end)
 
-        vals = self.bw.values(chrom, start, end)
-        vals = np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+        all_vals = []
+        for tr in self.tracks:
+            v = tr.values(chrom, start, end)
+            all_vals.append(np.nan_to_num(np.array(v, dtype=np.float64), nan=0.0))
 
         print(f"{C.DIM}{chrom}:{format_pos(start)}-{format_pos(end)}{C.RESET}")
-        for i, v in enumerate(vals):
+        if self.n_tracks > 1:
+            hdr = f"  {'pos':>12}"
+            for tr in self.tracks:
+                hdr += f"  {tr.basename:>12}"
+            print(f"{C.DIM}{hdr}{C.RESET}")
+
+        for i in range(end - start):
             pos = start + i
-            print(f"  {format_pos(pos):>12}  {v:.4f}")
+            line = f"  {format_pos(pos):>12}"
+            for ti in range(self.n_tracks):
+                line += f"  {all_vals[ti][i]:>12.4f}"
+            print(line)
 
     complete_head = _complete_chrom
 
@@ -623,13 +779,24 @@ class BWShell(cmd.Cmd):
         end = size
         self._set_region(chrom, start, end)
 
-        vals = self.bw.values(chrom, start, end)
-        vals = np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+        all_vals = []
+        for tr in self.tracks:
+            v = tr.values(chrom, start, end)
+            all_vals.append(np.nan_to_num(np.array(v, dtype=np.float64), nan=0.0))
 
         print(f"{C.DIM}{chrom}:{format_pos(start)}-{format_pos(end)}{C.RESET}")
-        for i, v in enumerate(vals):
+        if self.n_tracks > 1:
+            hdr = f"  {'pos':>12}"
+            for tr in self.tracks:
+                hdr += f"  {tr.basename:>12}"
+            print(f"{C.DIM}{hdr}{C.RESET}")
+
+        for i in range(end - start):
             pos = start + i
-            print(f"  {format_pos(pos):>12}  {v:.4f}")
+            line = f"  {format_pos(pos):>12}"
+            for ti in range(self.n_tracks):
+                line += f"  {all_vals[ti][i]:>12.4f}"
+            print(line)
 
     complete_tail = _complete_chrom
 
@@ -647,21 +814,32 @@ class BWShell(cmd.Cmd):
         tw = shutil.get_terminal_size((80, 24)).columns
         nbins = tw - 4
 
-        stats_mean = self.bw.stats(chrom, 0, size, type="mean", nBins=nbins)
-        stats_max_val = self.bw.stats(chrom, 0, size, type="max", nBins=nbins)
-        vals = np.nan_to_num(np.array(stats_mean, dtype=np.float64), nan=0.0)
-        vals_max = np.nan_to_num(np.array(stats_max_val, dtype=np.float64), nan=0.0)
+        for ti, tr in enumerate(self.tracks):
+            if chrom not in tr.chroms:
+                if self.n_tracks > 1:
+                    tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                    print(f"  {tc}{tr.basename}{C.RESET}  {C.DIM}(no {chrom}){C.RESET}")
+                continue
+            stats_mean = tr.bw.stats(chrom, 0, size, type="mean", nBins=nbins)
+            stats_max_val = tr.bw.stats(chrom, 0, size, type="max", nBins=nbins)
+            vals = np.nan_to_num(np.array(stats_mean, dtype=np.float64), nan=0.0)
+            vals_max = np.nan_to_num(np.array(stats_max_val, dtype=np.float64), nan=0.0)
 
-        overall_max = np.max(vals_max) if len(vals_max) > 0 else 0
-        overall_mean = np.mean(vals[vals > 0]) if np.any(vals > 0) else 0
-        coverage = np.sum(vals > 0) / len(vals) * 100
+            overall_max = np.max(vals_max) if len(vals_max) > 0 else 0
+            overall_mean = np.mean(vals[vals > 0]) if np.any(vals > 0) else 0
+            coverage = np.sum(vals > 0) / len(vals) * 100
 
-        print(f"\n  {C.BOLD}{chrom}{C.RESET}  {format_bp(size)}"
-              f"  {C.DIM}max={overall_max:.2f}  mean(nonzero)={overall_mean:.2f}"
-              f"  coverage={coverage:.0f}%{C.RESET}")
-        print(f"  {C.GREEN}{sparkline(vals, width=nbins)}{C.RESET}")
-        print(f"  {C.DIM}{format_pos(0)}{' ' * (nbins - len(format_pos(0)) - len(format_pos(size)))}"
-              f"{format_pos(size)}{C.RESET}")
+            tc = TRACK_ANSI[ti % len(TRACK_ANSI)] if self.n_tracks > 1 else ''
+            label = f" {tc}{tr.basename}{C.RESET}" if self.n_tracks > 1 else ""
+
+            print(f"\n  {C.BOLD}{chrom}{C.RESET}  {format_bp(size)}{label}"
+                  f"  {C.DIM}max={overall_max:.2f}  mean(nonzero)={overall_mean:.2f}"
+                  f"  coverage={coverage:.0f}%{C.RESET}")
+            sc = tc if tc else C.GREEN
+            print(f"  {sc}{sparkline(vals, width=nbins)}{C.RESET}")
+            if ti == self.n_tracks - 1 or self.n_tracks == 1:
+                print(f"  {C.DIM}{format_pos(0)}{' ' * (nbins - len(format_pos(0)) - len(format_pos(size)))}"
+                      f"{format_pos(size)}{C.RESET}")
         print()
 
     complete_peek = _complete_chrom
@@ -793,6 +971,10 @@ class BWShell(cmd.Cmd):
         curses.init_pair(4, -1, -1)                    # text
         curses.init_pair(5, curses.COLOR_RED, -1)      # highlight
 
+        # Per-track signal colors (pairs 10+)
+        for i, tc in enumerate(TRACK_CURSES_COLORS):
+            curses.init_pair(10 + i, tc, -1)
+
         curses.curs_set(0)
         stdscr.keypad(True)
         stdscr.timeout(-1)
@@ -822,6 +1004,19 @@ class BWShell(cmd.Cmd):
             status_msg = ""
 
             key = stdscr.getch()
+
+            if key == curses.KEY_RESIZE:
+                # Debounce: drain queued resize events, wait for settle
+                stdscr.timeout(50)
+                while stdscr.getch() != -1:
+                    pass
+                stdscr.timeout(-1)
+                # Use actual OS size (curses internal may be stale)
+                actual = shutil.get_terminal_size()
+                curses.resizeterm(actual.lines, actual.columns)
+                stdscr.clear()
+                stdscr.refresh()
+                continue
 
             if key == ord('q') or key == 27:  # q or Esc
                 break
@@ -928,19 +1123,19 @@ class BWShell(cmd.Cmd):
                 if result is not None:
                     r = result.strip()
                     if r.lower() == 'auto' or r == '':
-                        self.ymin = None
-                        self.ymax = None
+                        self.ymin = [None] * self.n_tracks
+                        self.ymax = [None] * self.n_tracks
                         status_msg = "ylim: auto"
                     else:
                         parts = r.split()
                         try:
                             if len(parts) == 1:
-                                self.ymin = 0
-                                self.ymax = float(parts[0])
+                                ylo, yhi = 0, float(parts[0])
                             else:
-                                self.ymin = float(parts[0])
-                                self.ymax = float(parts[1])
-                            status_msg = f"ylim: [{self.ymin:.4g}, {self.ymax:.4g}]"
+                                ylo, yhi = float(parts[0]), float(parts[1])
+                            self.ymin = [ylo] * self.n_tracks
+                            self.ymax = [yhi] * self.n_tracks
+                            status_msg = f"ylim: [{ylo:.4g}, {yhi:.4g}]"
                         except ValueError:
                             status_msg = f"Invalid: {r}"
 
@@ -959,13 +1154,6 @@ class BWShell(cmd.Cmd):
                         end = start + new_span
                 except:
                     pass
-
-            elif key == curses.KEY_RESIZE:
-                try:
-                    curses.update_lines_cols()
-                except AttributeError:
-                    pass  # Python < 3.7.1
-                stdscr.clear()
 
         self._set_region(chrom, start, end)
 
@@ -988,25 +1176,6 @@ class BWShell(cmd.Cmd):
             data_bins = min(span, plot_width * 2)
         else:
             data_bins = min(span, plot_width)
-        try:
-            vals = self._get_values_exact(chrom, start, end, nbins=data_bins)
-        except:
-            vals = np.zeros(data_bins)
-
-        data_max = np.max(vals) if len(vals) > 0 else 0
-        data_min = np.min(vals) if len(vals) > 0 else 0
-        vmean = np.mean(vals) if len(vals) > 0 else 0
-        nonzero_frac = np.sum(vals > 0) / max(1, len(vals)) * 100
-
-        # Apply user ylim or auto
-        disp_ymin = self.ymin if self.ymin is not None else min(0, data_min)
-        disp_ymax = self.ymax if self.ymax is not None else data_max
-        if disp_ymax <= disp_ymin:
-            disp_ymax = disp_ymin + 1
-        vmax = disp_ymax  # used by draw functions
-
-        plot_height = max(3, height - 8)
-        plot_start_row = 3
 
         # Effective resolution
         if render_mode == 'braille':
@@ -1023,39 +1192,92 @@ class BWShell(cmd.Cmd):
             res_str = f"{bp_per:.0f} bp/col" if bp_per >= 1 else f"{1/bp_per:.0f} col/bp"
             mode_tag = " [block]"
 
+        # ── Fetch per-track data ──
+        track_data = []
+        for ti, track in enumerate(self.tracks):
+            try:
+                vals = self._get_values_exact_track(track, chrom, start, end, nbins=data_bins)
+            except Exception:
+                vals = np.zeros(data_bins)
+            dmax = np.max(vals) if len(vals) > 0 else 0
+            dmin = np.min(vals) if len(vals) > 0 else 0
+            dmean = np.mean(vals) if len(vals) > 0 else 0
+            dcov = np.sum(vals > 0) / max(1, len(vals)) * 100
+            dymin = self.ymin[ti] if self.ymin[ti] is not None else dmin
+            dymax = self.ymax[ti] if self.ymax[ti] is not None else dmax
+            if dymax <= dymin:
+                dymax = dymin + 1
+            track_data.append((vals, dmax, dmean, dcov, dymin, dymax))
+
+        # ── Layout ──
+        n = self.n_tracks
+        overhead = 8  # header(2) + blank + xaxis + labels + minimap + help + margin
+        separators = max(0, n - 1)
+        available = max(n * 3, height - overhead - separators)
+        track_h = available // n
+        plot_start_row = 3
+
         # ── Header ──
         header = f" {chrom}:{format_pos(start)}-{format_pos(end)}  ({format_bp(span)})"
         self._safe_addstr(stdscr, 0, 0, header, curses.A_BOLD)
 
         nan_tag = "" if self.nan_zero else " [nanmean]"
-        ylim_tag = "" if (self.ymin is None and self.ymax is None) else " [ylim]"
-        stats_line = (f" max={data_max:.2f}  mean={vmean:.2f}  "
-                      f"cov={nonzero_frac:.0f}%  [{res_str}]{mode_tag}{nan_tag}{ylim_tag}")
+        ylim_tag = "" if all(y is None for y in self.ymin) else " [ylim]"
+        if n == 1:
+            vals, dmax, dmean, dcov, _, _ = track_data[0]
+            stats_line = (f" max={dmax:.2f}  mean={dmean:.2f}  "
+                          f"cov={dcov:.0f}%  [{res_str}]{mode_tag}{nan_tag}{ylim_tag}")
+        else:
+            parts = []
+            for ti, t in enumerate(self.tracks):
+                _, dmax, dmean, dcov, _, _ = track_data[ti]
+                parts.append(f"[{ti}]max={dmax:.2g}")
+            stats_line = f" {'  '.join(parts)}  [{res_str}]{mode_tag}{nan_tag}{ylim_tag}"
         self._safe_addstr(stdscr, 1, 0, stats_line, curses.color_pair(3))
 
-        # ── Signal plot ──
-        SIG_ATTR = curses.color_pair(1) | curses.A_BOLD
+        # ── Signal plots (per-track) ──
         AXIS_ATTR = curses.color_pair(2)
+        cur_row = plot_start_row
 
-        if disp_ymax > disp_ymin and len(vals) > 0:
-            if render_mode == 'braille':
-                self._draw_braille(stdscr, vals, disp_ymin, disp_ymax, plot_start_row,
-                                   plot_height, plot_width, SIG_ATTR, AXIS_ATTR)
-            elif render_mode == 'halfblock':
-                self._draw_halfblock(stdscr, vals, disp_ymin, disp_ymax, plot_start_row,
-                                     plot_height, plot_width, SIG_ATTR, AXIS_ATTR)
+        for ti, track in enumerate(self.tracks):
+            vals, dmax, dmean, dcov, dymin, dymax = track_data[ti]
+            if n > 1:
+                sig_attr = curses.color_pair(10 + ti % len(TRACK_CURSES_COLORS)) | curses.A_BOLD
             else:
-                self._draw_blocks(stdscr, vals, disp_ymin, disp_ymax, plot_start_row,
-                                  plot_height, plot_width, SIG_ATTR, AXIS_ATTR)
-        else:
-            row = plot_start_row + plot_height // 2
-            self._safe_addstr(stdscr, row, 10, "(no signal in region)", curses.A_DIM)
-            for ri in range(plot_height):
-                self._safe_addstr(stdscr, plot_start_row + ri, 0,
-                                  f"{'':>8} \u2502", AXIS_ATTR)
+                sig_attr = curses.color_pair(1) | curses.A_BOLD
+
+            if dymax > dymin and len(vals) > 0:
+                if render_mode == 'braille':
+                    self._draw_braille(stdscr, vals, dymin, dymax, cur_row,
+                                       track_h, plot_width, sig_attr, AXIS_ATTR)
+                elif render_mode == 'halfblock':
+                    self._draw_halfblock(stdscr, vals, dymin, dymax, cur_row,
+                                         track_h, plot_width, sig_attr, AXIS_ATTR)
+                else:
+                    self._draw_blocks(stdscr, vals, dymin, dymax, cur_row,
+                                      track_h, plot_width, sig_attr, AXIS_ATTR)
+            else:
+                row = cur_row + track_h // 2
+                self._safe_addstr(stdscr, row, 10, "(no signal)", curses.A_DIM)
+                for ri in range(track_h):
+                    self._safe_addstr(stdscr, cur_row + ri, 0,
+                                      f"{'':>8} \u2502", AXIS_ATTR)
+
+            # Track label: overlay after ymax value on the top row
+            if n > 1:
+                label = ' ' + track.basename
+                self._safe_addstr(stdscr, cur_row, 10,
+                                  label, curses.color_pair(10 + ti % len(TRACK_CURSES_COLORS)))
+
+            cur_row += track_h
+            # Separator between tracks
+            if ti < n - 1:
+                sep = f"{'':>9}" + '\u2500' * min(plot_width, width - 10)
+                self._safe_addstr(stdscr, cur_row, 0, sep, curses.A_DIM)
+                cur_row += 1
 
         # ── X-axis ──
-        xaxis_y = plot_start_row + plot_height
+        xaxis_y = cur_row
         axis_line = f"{'':>9}\u2514" + '\u2500' * plot_width + '\u2518'
         self._safe_addstr(stdscr, xaxis_y, 0, axis_line, AXIS_ATTR)
 
@@ -1076,7 +1298,7 @@ class BWShell(cmd.Cmd):
         if minimap_y > label_y + 1:
             mini_width = width - 4
             try:
-                mini_vals = self.bw.stats(chrom, 0, size, type="mean", nBins=mini_width)
+                mini_vals = self.tracks[0].stats(chrom, 0, size, type="mean", nBins=mini_width)
                 mini_arr = np.nan_to_num(np.array(mini_vals, dtype=np.float64), nan=0.0)
             except:
                 mini_arr = np.zeros(mini_width)
@@ -1121,7 +1343,7 @@ class BWShell(cmd.Cmd):
 
     def _draw_blocks(self, stdscr, vals, ymin, ymax, start_row, plot_h, plot_w,
                      sig_attr, axis_attr):
-        """Block-character signal plot (1:1 column mapping)."""
+        """Block-character signal plot (1:1 column mapping), zero-baseline."""
         span_y = ymax - ymin
         # Resample to plot_w bins
         if len(vals) > plot_w:
@@ -1133,28 +1355,33 @@ class BWShell(cmd.Cmd):
         else:
             pv = vals
         norm = np.clip((pv - ymin) / span_y * plot_h, 0, plot_h)
+        zero_h = np.clip((0 - ymin) / span_y * plot_h, 0, plot_h)
 
         for ri in range(plot_h):
-            row_val = plot_h - ri
+            row_val = plot_h - ri  # height from bottom for this row (top=plot_h)
             ry = start_row + ri
 
             if ri == 0:
-                label = f"{ymax:>8.2f} \u2502"
+                label = f"{ymax:>8.3g} \u2502"
             elif ri == plot_h - 1:
-                label = f"{ymin:>8.2f} \u2502"
+                label = f"{ymin:>8.3g} \u2502"
             elif ri == plot_h // 2:
                 mid_val = (ymin + ymax) / 2
-                label = f"{mid_val:>8.2f} \u2502"
+                label = f"{mid_val:>8.3g} \u2502"
             else:
                 label = f"{'':>8} \u2502"
             self._safe_addstr(stdscr, ry, 0, label, axis_attr)
 
             chars = []
             for v in norm[:plot_w]:
-                if v >= row_val:
+                lo = min(v, zero_h)
+                hi = max(v, zero_h)
+                # Cell spans [row_val-1, row_val) in height-from-bottom
+                overlap = max(0.0, min(hi, row_val) - max(lo, row_val - 1))
+                if overlap >= 1.0:
                     chars.append('\u2588')
-                elif v > row_val - 1:
-                    idx = min(8, max(1, int((v - (row_val - 1)) * 8)))
+                elif overlap > 0:
+                    idx = min(8, max(1, int(overlap * 8)))
                     chars.append(BLOCKS[idx])
                 else:
                     chars.append(' ')
@@ -1162,11 +1389,9 @@ class BWShell(cmd.Cmd):
 
     def _draw_halfblock(self, stdscr, vals, ymin, ymax, start_row, plot_h, plot_w,
                         sig_attr, axis_attr):
-        """Half-block signal plot: solid filled bars with 2x vertical resolution.
+        """Half-block signal plot with zero-baseline (2x vertical resolution).
 
-        Uses \u2584 (lower half) and \u2588 (full block). Each character row
-        encodes 2 vertical pixels, so effective vertical resolution = plot_h * 2.
-        Looks identical to block mode but with smoother peak edges.
+        Uses \u2584 (lower half), \u2580 (upper half), and \u2588 (full block).
         """
         span_y = ymax - ymin
         px_h = plot_h * 2  # 2 vertical pixels per char row
@@ -1181,35 +1406,40 @@ class BWShell(cmd.Cmd):
         else:
             pv = vals
         norm = np.clip((pv - ymin) / span_y * px_h, 0, px_h)
+        zero_h = np.clip((0 - ymin) / span_y * px_h, 0, px_h)
 
         for cr in range(plot_h):
             ry = start_row + cr
 
             # Y-axis label
             if cr == 0:
-                label = f"{ymax:>8.2f} \u2502"
+                label = f"{ymax:>8.3g} \u2502"
             elif cr == plot_h - 1:
-                label = f"{ymin:>8.2f} \u2502"
+                label = f"{ymin:>8.3g} \u2502"
             elif cr == plot_h // 2:
                 mid_val = (ymin + ymax) / 2
-                label = f"{mid_val:>8.2f} \u2502"
+                label = f"{mid_val:>8.3g} \u2502"
             else:
                 label = f"{'':>8} \u2502"
             self._safe_addstr(stdscr, ry, 0, label, axis_attr)
 
-            # Two pixel rows per character cell:
-            #   py_upper (top half) = higher threshold
-            #   py_lower (bottom half) = lower threshold
-            # pixel_y 0 = bottom of plot, px_h-1 = top
-            py_upper = (plot_h - 1 - cr) * 2 + 1
-            py_lower = (plot_h - 1 - cr) * 2
+            # Two pixel rows per character cell (bottom=lower, top=upper)
+            py_lower = (plot_h - 1 - cr) * 2      # pixel y of lower half
+            py_upper = (plot_h - 1 - cr) * 2 + 1  # pixel y of upper half
 
             chars = []
             for v in norm[:plot_w]:
-                if v > py_upper:
-                    chars.append('\u2588')   # full block: both halves filled
-                elif v > py_lower:
-                    chars.append('\u2584')   # lower half: signal just enters cell
+                lo = min(v, zero_h)
+                hi = max(v, zero_h)
+                # Does the bar cover each half-pixel?
+                upper_on = (hi > py_upper and lo < py_upper + 1)
+                lower_on = (hi > py_lower and lo < py_lower + 1)
+                if upper_on and lower_on:
+                    chars.append('\u2588')   # full block
+                elif lower_on:
+                    chars.append('\u2584')   # lower half
+                elif upper_on:
+                    chars.append('\u2580')   # upper half
                 else:
                     chars.append(' ')
             self._safe_addstr(stdscr, ry, 10, ''.join(chars), sig_attr)
@@ -1235,6 +1465,7 @@ class BWShell(cmd.Cmd):
         else:
             pv = vals
         norm = np.clip((pv - ymin) / span_y * px_h, 0, px_h)
+        zero_h = np.clip((0 - ymin) / span_y * px_h, 0, px_h)
 
         # Braille dot bits: [sub_row][sub_col] -> bitmask
         # sub_row 0 = top of cell, 3 = bottom
@@ -1248,12 +1479,12 @@ class BWShell(cmd.Cmd):
 
             # Y-axis label
             if cr == 0:
-                label = f"{ymax:>8.2f} \u2502"
+                label = f"{ymax:>8.3g} \u2502"
             elif cr == plot_h - 1:
-                label = f"{ymin:>8.2f} \u2502"
+                label = f"{ymin:>8.3g} \u2502"
             elif cr == plot_h // 2:
                 mid_val = (ymin + ymax) / 2
-                label = f"{mid_val:>8.2f} \u2502"
+                label = f"{mid_val:>8.3g} \u2502"
             else:
                 label = f"{'':>8} \u2502"
             self._safe_addstr(stdscr, ry, 0, label, axis_attr)
@@ -1266,10 +1497,12 @@ class BWShell(cmd.Cmd):
                     if px_x >= len(norm):
                         continue
                     h = norm[px_x]
+                    lo = min(h, zero_h)
+                    hi = max(h, zero_h)
                     for sr in range(4):  # dot rows top-to-bottom
                         # pixel y for this dot (0 = bottom of plot)
                         py = (plot_h - 1 - cr) * 4 + (3 - sr)
-                        if h > py:
+                        if py >= lo and py < hi:
                             code |= DB[sr][sc]
                 chars.append(chr(code))
             self._safe_addstr(stdscr, ry, 10, ''.join(chars), sig_attr)
@@ -1353,9 +1586,31 @@ class BWShell(cmd.Cmd):
         rows, cols = shutil.get_terminal_size()
         return rows, cols, cols * 8, rows * 16
 
+    _resized = False
+
     def _read_key(self, fd):
         """Read a single keypress in raw/cbreak terminal mode."""
-        ch = os.read(fd, 1)
+        # Poll with timeout so SIGWINCH (which sets _resized) is detected
+        # promptly — Python 3.5+ auto-retries os.read on EINTR (PEP 475),
+        # so we can't rely on OSError to wake us up.
+        while True:
+            if self._resized:
+                self._resized = False
+                return 'RESIZE'
+            ready, _, _ = select.select([fd], [], [], 0.1)
+            if not ready:
+                continue
+            try:
+                ch = os.read(fd, 1)
+            except OSError:
+                self._resized = False
+                return 'RESIZE'
+            if not ch:
+                return ''
+            if self._resized:
+                self._resized = False
+                return 'RESIZE'
+            break
         if ch == b'\x1b':
             # Possible escape sequence
             if select.select([fd], [], [], 0.05)[0]:
@@ -1411,8 +1666,13 @@ class BWShell(cmd.Cmd):
                     pass
         return ''.join(buf)
 
-    def _render_signal_pixels(self, vals, width, height, ymin=0, ymax=None):
-        """Render signal to pixel array (H x W, uint8: 0=bg, 1=signal, 2=axis)."""
+    def _render_signal_pixels(self, vals, width, height, ymin=0, ymax=None,
+                              signal_pv=1, axis_pv=2):
+        """Render signal to pixel array with zero-baseline.
+
+        Pixel values: 0=bg, signal_pv=signal fill, axis_pv=axis lines.
+        Positive values fill upward from zero; negative values fill downward.
+        """
         if len(vals) != width:
             resampled = np.interp(
                 np.linspace(0, 1, width),
@@ -1426,27 +1686,43 @@ class BWShell(cmd.Cmd):
         if span_y <= 0:
             pixels = np.zeros((height, width), dtype=np.uint8)
         else:
-            norm = np.clip((resampled - ymin) / span_y * height, 0, height).astype(np.int32)
-            row_idx = np.arange(height)[:, np.newaxis]
-            threshold = (height - norm)[np.newaxis, :]
-            pixels = (row_idx >= threshold).astype(np.uint8)
+            # Norm: height from bottom in pixels for each value and for zero
+            norm = np.clip((resampled - ymin) / span_y * height, 0, height)
+            zero_h = np.clip((0 - ymin) / span_y * height, 0, height)
 
-        # Axis lines (value 2, drawn on top of signal)
-        pixels[-1, :] = 2     # x-axis along bottom
-        pixels[:, 0] = 2      # y-axis along left edge
+            # Convert to row indices (row 0 = top)
+            val_row = (height - norm).astype(np.float64)   # per-column
+            zero_row = float(height - zero_h)
+
+            # Fill between zero_row and val_row for each column
+            top = np.minimum(val_row, zero_row)[np.newaxis, :]
+            bot = np.maximum(val_row, zero_row)[np.newaxis, :]
+            row_idx = np.arange(height, dtype=np.float64)[:, np.newaxis]
+            pixels = np.where((row_idx >= top) & (row_idx < bot),
+                              signal_pv, np.uint8(0)).astype(np.uint8)
+
+        # Axis lines (drawn on top of signal)
+        pixels[-1, :] = axis_pv     # x-axis along bottom
+        pixels[:, 0] = axis_pv      # y-axis along left edge
+        # Zero line (if zero is visible in range)
+        if span_y > 0 and ymin < 0 < ymax:
+            zero_px_row = int(height - (0 - ymin) / span_y * height)
+            if 0 <= zero_px_row < height:
+                pixels[zero_px_row, :] = axis_pv
         # Y-axis tick marks at 25%, 50%, 75%
         for frac in (0.25, 0.5, 0.75):
             y = int(height * (1 - frac))
             if 0 <= y < height:
-                pixels[y, 0:4] = 2
+                pixels[y, 0:4] = axis_pv
 
         return pixels
 
-    def _encode_sixel(self, pixels):
-        """Encode pixel array as sixel with explicit bg/signal/axis colors.
+    def _encode_sixel(self, pixels, n_signals=1):
+        """Encode pixel array as sixel with dynamic number of colors.
 
-        pixels: (H, W) uint8 — 0=background, 1=signal, 2=axis.
-        All pixels are painted explicitly (no transparency needed).
+        pixels: (H, W) uint8 — 0=background, 1..n_signals=track signals,
+                n_signals+1=axis.
+        n_signals: number of signal tracks (determines color palette).
         """
         h, w = pixels.shape
         pad = (6 - h % 6) % 6
@@ -1454,25 +1730,45 @@ class BWShell(cmd.Cmd):
             pixels = np.vstack([np.zeros((pad, w), dtype=np.uint8), pixels])
             h += pad
 
+        axis_pv = n_signals + 1
+        n_vals = axis_pv + 1  # total distinct pixel values
+
         n_bands = h // 6
         parts = ['\033Pq']
         parts.append(f'"1;1;{w};{h}')
 
-        # Theme-aware colors (sixel uses 0-100 percentage)
-        if self.dark_bg:
-            parts.append('#0;2;12;12;12')     # bg: near-black
-            parts.append('#1;2;85;85;85')     # signal: light grey
-            parts.append('#2;2;35;35;35')     # axis: dim grey
+        # Color definitions
+        if n_signals == 1:
+            # Single track: monochrome grey (backward compat)
+            if self.dark_bg:
+                parts.append('#0;2;12;12;12')     # bg
+                parts.append('#1;2;85;85;85')     # signal
+                parts.append('#2;2;35;35;35')     # axis
+            else:
+                parts.append('#0;2;100;100;100')  # bg
+                parts.append('#1;2;8;8;8')        # signal
+                parts.append('#2;2;65;65;65')     # axis
         else:
-            parts.append('#0;2;100;100;100')  # bg: white
-            parts.append('#1;2;8;8;8')        # signal: near-black
-            parts.append('#2;2;65;65;65')     # axis: medium grey
+            # Multi-track: colored per track
+            if self.dark_bg:
+                parts.append('#0;2;12;12;12')     # bg
+            else:
+                parts.append('#0;2;100;100;100')  # bg
+            for ti in range(n_signals):
+                dark_rgb, light_rgb = TRACK_SIXEL[ti % len(TRACK_SIXEL)]
+                r, g, b = dark_rgb if self.dark_bg else light_rgb
+                parts.append(f'#{ti + 1};2;{r};{g};{b}')
+            # Axis color
+            if self.dark_bg:
+                parts.append(f'#{axis_pv};2;35;35;35')
+            else:
+                parts.append(f'#{axis_pv};2;65;65;65')
 
         for band in range(n_bands):
             chunk = pixels[band * 6:band * 6 + 6, :]
             first = True
 
-            for val in range(3):  # 0=bg, 1=signal, 2=axis
+            for val in range(n_vals):
                 mask = (chunk == val)
                 packed = np.zeros(w, dtype=np.uint8)
                 for bit in range(6):
@@ -1525,7 +1821,13 @@ class BWShell(cmd.Cmd):
         status_msg = ''
         w = sys.stdout.write
 
+        old_sigwinch = signal.getsignal(signal.SIGWINCH)
+
+        def _on_resize(signum, frame):
+            self._resized = True
+
         try:
+            signal.signal(signal.SIGWINCH, _on_resize)
             tty.setcbreak(fd)
             w('\033[?25l')  # hide cursor
             sys.stdout.flush()
@@ -1543,34 +1845,55 @@ class BWShell(cmd.Cmd):
 
                 # Text lines: header(1) + stats(1) + [plot] + xaxis(1) + help(1) = 4
                 text_lines = 4
-                y_margin = 6  # chars reserved for y-axis labels
+                y_margin = 8  # chars reserved for y-axis labels
                 plot_char_rows = max(5, t_rows - text_lines)
                 plot_px_w = max(100, (t_cols - y_margin) * cell_w)
-                plot_px_h = max(50, plot_char_rows * cell_h)
+                total_px_h = max(50, plot_char_rows * cell_h)
 
-                # Fetch data at pixel resolution
+                nt = self.n_tracks
+                axis_pv = nt + 1
+                sep_px = 2 if nt > 1 else 0  # pixel separator between tracks
+                usable_px = total_px_h - sep_px * max(0, nt - 1)
+                track_px_h = max(20, usable_px // nt)
+
+                # Fetch data for all tracks
                 nbins = min(span, plot_px_w)
-                try:
-                    vals = self._get_values_exact(chrom, start, end, nbins=nbins)
-                except:
-                    vals = np.zeros(nbins)
+                track_vals = []
+                track_ymins = []
+                track_ymaxs = []
+                for ti, tr in enumerate(self.tracks):
+                    try:
+                        v = self._get_values_exact_track(tr, chrom, start, end, nbins=nbins)
+                    except:
+                        v = np.zeros(nbins)
+                    track_vals.append(v)
+                    dmin = np.min(v) if len(v) > 0 else 0
+                    dmax = np.max(v) if len(v) > 0 else 0
+                    ylo = self.ymin[ti] if self.ymin[ti] is not None else dmin
+                    yhi = self.ymax[ti] if self.ymax[ti] is not None else dmax
+                    if yhi <= ylo:
+                        yhi = ylo + 1
+                    track_ymins.append(ylo)
+                    track_ymaxs.append(yhi)
 
-                data_max = np.max(vals) if len(vals) > 0 else 0
-                data_min = np.min(vals) if len(vals) > 0 else 0
-                vmean = np.mean(vals) if len(vals) > 0 else 0
-                nz_frac = np.sum(vals > 0) / max(1, len(vals)) * 100
+                # Render and stack pixel arrays
+                pixel_strips = []
+                for ti in range(nt):
+                    pv = ti + 1
+                    px = self._render_signal_pixels(
+                        track_vals[ti], plot_px_w, track_px_h,
+                        ymin=track_ymins[ti], ymax=track_ymaxs[ti],
+                        signal_pv=pv, axis_pv=axis_pv)
+                    pixel_strips.append(px)
+                    if ti < nt - 1 and sep_px > 0:
+                        sep = np.full((sep_px, plot_px_w), axis_pv, dtype=np.uint8)
+                        pixel_strips.append(sep)
+
+                pixels = np.vstack(pixel_strips)
+                actual_px_h = pixels.shape[0]
+                sixel = self._encode_sixel(pixels, n_signals=nt)
+
                 bp_px = span / max(1, plot_px_w)
-
-                # Y-axis limits (user-set or auto)
-                disp_ymin = self.ymin if self.ymin is not None else min(0, data_min)
-                disp_ymax = self.ymax if self.ymax is not None else data_max
-                if disp_ymax <= disp_ymin:
-                    disp_ymax = disp_ymin + 1
-
-                # Render pixel array
-                pixels = self._render_signal_pixels(vals, plot_px_w, plot_px_h,
-                                                    ymin=disp_ymin, ymax=disp_ymax)
-                sixel = self._encode_sixel(pixels)
 
                 # Draw screen (synchronized output prevents flashing)
                 w('\033[?2026h')
@@ -1584,10 +1907,22 @@ class BWShell(cmd.Cmd):
                 header = f" {chrom}:{format_pos(start)}-{format_pos(end)}  ({format_bp(span)})"
                 res_str = f"{bp_px:.1f} bp/px" if bp_px >= 1 else f"{1/bp_px:.0f} px/bp"
                 nan_tag = "" if self.nan_zero else " [nanmean]"
-                ylim_tag = "" if (self.ymin is None and self.ymax is None) else " [ylim]"
-                stats_line = (f" max={data_max:.2f}  mean={vmean:.2f}  "
-                              f"cov={nz_frac:.0f}%  [{res_str}]  "
-                              f"[{plot_px_w}\u00d7{plot_px_h}px]{nan_tag}{ylim_tag}")
+                ylim_tag = "" if all(y is None for y in self.ymin) else " [ylim]"
+                if nt == 1:
+                    v0 = track_vals[0]
+                    data_max = np.max(v0) if len(v0) > 0 else 0
+                    vmean = np.mean(v0) if len(v0) > 0 else 0
+                    nz_frac = np.sum(v0 > 0) / max(1, len(v0)) * 100
+                    stats_line = (f" max={data_max:.2f}  mean={vmean:.2f}  "
+                                  f"cov={nz_frac:.0f}%  [{res_str}]  "
+                                  f"[{plot_px_w}\u00d7{actual_px_h}px]{nan_tag}{ylim_tag}")
+                else:
+                    maxes = '  '.join(
+                        f"{tr.basename}:{np.max(v):.3g}"
+                        for tr, v in zip(self.tracks, track_vals)
+                        if len(v) > 0)
+                    stats_line = (f" max: {maxes}  [{res_str}]  "
+                                  f"[{plot_px_w}\u00d7{actual_px_h}px]{nan_tag}{ylim_tag}")
                 w(f'{BO}{header}{RS}\r\n')
                 w(f'{DM}{stats_line}{RS}\r\n')
 
@@ -1596,16 +1931,35 @@ class BWShell(cmd.Cmd):
                 w(f'\033[{y_margin}C')  # indent
                 w(sixel)
 
-                # Y-axis labels overlaid at left margin
-                sixel_rows = (plot_px_h + cell_h - 1) // cell_h
-                w(f'\033[{img_top};1H{DM}{disp_ymax:>5.2f}{RS}')
-                mid_row = img_top + sixel_rows // 2
-                mid_val = (disp_ymin + disp_ymax) / 2
-                w(f'\033[{mid_row};1H{DM}{mid_val:>5.2f}{RS}')
-                w(f'\033[{img_top + sixel_rows - 1};1H{DM}{disp_ymin:>5.2f}{RS}')
+                # Y-axis labels overlaid at left margin (per track)
+                sixel_char_rows = (actual_px_h + cell_h - 1) // cell_h
+                track_char_h = (track_px_h + cell_h - 1) // cell_h
+                sep_char_h = (sep_px + cell_h - 1) // cell_h if sep_px > 0 else 0
+                for ti in range(nt):
+                    row_off = img_top + ti * (track_char_h + sep_char_h)
+                    yhi = track_ymaxs[ti]
+                    ylo = track_ymins[ti]
+                    mid_val = (ylo + yhi) / 2
+                    # Top row: ymax + track name (for multi-track)
+                    if nt > 1:
+                        tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                        w(f'\033[{row_off};1H{DM}{yhi:>7.3g}{RS}'
+                          f' {tc}{self.tracks[ti].basename}{RS}')
+                    else:
+                        w(f'\033[{row_off};1H{DM}{yhi:>7.3g}{RS}')
+                    # Zero line label (if zero is visible)
+                    if ylo < 0 < yhi:
+                        zero_frac = (0 - ylo) / (yhi - ylo)
+                        zero_r = row_off + int(track_char_h * (1 - zero_frac))
+                        if zero_r != row_off and zero_r != row_off + track_char_h - 1:
+                            w(f'\033[{zero_r};1H{DM}{"0":>7s}{RS}')
+                    mid_r = row_off + track_char_h // 2
+                    w(f'\033[{mid_r};1H{DM}{mid_val:>7.3g}{RS}')
+                    bot_r = row_off + track_char_h - 1
+                    w(f'\033[{bot_r};1H{DM}{ylo:>7.3g}{RS}')
 
                 # Move below sixel for x-axis labels
-                after_row = img_top + sixel_rows
+                after_row = img_top + sixel_char_rows
                 w(f'\033[{after_row};1H')
 
                 # X-axis labels (indented to match plot)
@@ -1636,6 +1990,8 @@ class BWShell(cmd.Cmd):
                 # Read keypress
                 key = self._read_key(fd)
 
+                if key == 'RESIZE':
+                    continue  # redraw at new size
                 if key == 'q' or key == 'ESC':
                     break
                 elif key == 'LEFT' or key == 'h':
@@ -1668,16 +2024,18 @@ class BWShell(cmd.Cmd):
                     end = start + new_span
                 elif key == 's':
                     try:
-                        sv = self._get_values(chrom, start, end)
-                        nz = sv[sv > 0]
-                        if len(nz) > 0:
-                            status_msg = (
-                                f"min={np.min(sv):.3g}  max={np.max(sv):.3g}  "
-                                f"mean={np.mean(sv):.3g}  std={np.std(sv):.3g}  "
-                                f"median={np.median(sv):.3g}  "
-                                f"cov={len(nz)/len(sv)*100:.0f}%")
-                        else:
-                            status_msg = "No signal"
+                        parts_s = []
+                        for ti, tr in enumerate(self.tracks):
+                            sv = self._get_values_track(tr, chrom, start, end)
+                            nz = sv[sv > 0]
+                            if len(nz) > 0:
+                                label = tr.basename + ': ' if nt > 1 else ''
+                                parts_s.append(
+                                    f"{label}min={np.min(sv):.3g} max={np.max(sv):.3g} "
+                                    f"mean={np.mean(sv):.3g} cov={len(nz)/len(sv)*100:.0f}%")
+                            else:
+                                parts_s.append(f"{tr.basename}: no signal" if nt > 1 else "No signal")
+                        status_msg = '  |  '.join(parts_s)
                     except:
                         status_msg = "Stats error"
                 elif key == 'n':
@@ -1696,19 +2054,19 @@ class BWShell(cmd.Cmd):
                     if result is not None:
                         r = result.strip()
                         if r.lower() == 'auto' or r == '':
-                            self.ymin = None
-                            self.ymax = None
+                            self.ymin = [None] * self.n_tracks
+                            self.ymax = [None] * self.n_tracks
                             status_msg = "ylim: auto"
                         else:
                             parts = r.split()
                             try:
                                 if len(parts) == 1:
-                                    self.ymin = 0
-                                    self.ymax = float(parts[0])
+                                    ylo, yhi = 0, float(parts[0])
                                 else:
-                                    self.ymin = float(parts[0])
-                                    self.ymax = float(parts[1])
-                                status_msg = f"ylim: [{self.ymin:.4g}, {self.ymax:.4g}]"
+                                    ylo, yhi = float(parts[0]), float(parts[1])
+                                self.ymin = [ylo] * self.n_tracks
+                                self.ymax = [yhi] * self.n_tracks
+                                status_msg = f"ylim: [{ylo:.4g}, {yhi:.4g}]"
                             except ValueError:
                                 status_msg = f"Invalid: {r}"
                 elif key == 'g':
@@ -1745,6 +2103,7 @@ class BWShell(cmd.Cmd):
                             status_msg = f"Unknown: {result}"
 
         finally:
+            signal.signal(signal.SIGWINCH, old_sigwinch)
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
             w('\033[?25h')   # show cursor
             w('\033[2J\033[H')  # clear
@@ -1759,51 +2118,61 @@ class BWShell(cmd.Cmd):
         if arg.strip() and arg.strip() in self.chroms:
             chrom = arg.strip()
             size = self.chroms[chrom]
-            # Get stats for the whole chrom
-            st = self.bw.stats(chrom, 0, size, type="mean", nBins=1)
-            st_max = self.bw.stats(chrom, 0, size, type="max", nBins=1)
-            st_min = self.bw.stats(chrom, 0, size, type="min", nBins=1)
-            cov = self.bw.stats(chrom, 0, size, type="coverage", nBins=1)
-
-            mean_val = st[0] if st[0] is not None else 0
-            max_val = st_max[0] if st_max[0] is not None else 0
-            min_val = st_min[0] if st_min[0] is not None else 0
-            cov_val = cov[0] if cov[0] is not None else 0
-
             print(f"  {C.BOLD}Chromosome:{C.RESET} {chrom}")
             print(f"  {C.BOLD}Size:{C.RESET}       {format_bp(size)} ({size:,} bp)")
-            print(f"  {C.BOLD}Min:{C.RESET}        {min_val:.4f}")
-            print(f"  {C.BOLD}Max:{C.RESET}        {max_val:.4f}")
-            print(f"  {C.BOLD}Mean:{C.RESET}       {mean_val:.4f}")
-            print(f"  {C.BOLD}Coverage:{C.RESET}   {cov_val * 100:.1f}%")
+
+            for ti, tr in enumerate(self.tracks):
+                if chrom not in tr.chroms:
+                    if self.n_tracks > 1:
+                        tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                        print(f"  {tc}{tr.basename}{C.RESET}: (no {chrom})")
+                    continue
+                st = tr.bw.stats(chrom, 0, size, type="mean", nBins=1)
+                st_max = tr.bw.stats(chrom, 0, size, type="max", nBins=1)
+                st_min = tr.bw.stats(chrom, 0, size, type="min", nBins=1)
+                cov = tr.bw.stats(chrom, 0, size, type="coverage", nBins=1)
+                mean_val = st[0] if st[0] is not None else 0
+                max_val = st_max[0] if st_max[0] is not None else 0
+                min_val = st_min[0] if st_min[0] is not None else 0
+                cov_val = cov[0] if cov[0] is not None else 0
+                if self.n_tracks > 1:
+                    tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                    print(f"  {tc}{C.BOLD}{tr.basename}{C.RESET}")
+                print(f"  {C.BOLD}Min:{C.RESET}        {min_val:.4f}")
+                print(f"  {C.BOLD}Max:{C.RESET}        {max_val:.4f}")
+                print(f"  {C.BOLD}Mean:{C.RESET}       {mean_val:.4f}")
+                print(f"  {C.BOLD}Coverage:{C.RESET}   {cov_val * 100:.1f}%")
             return
 
-        # File-level info
-        fsize = format_size(os.path.getsize(self.filename))
+        # File-level info (per track)
         total_bp = sum(self.chroms.values())
-        n_main = sum(1 for c in self.chroms if not '_' in c or c.startswith('chr'))
+        n_main = sum(1 for c in self.chroms if '_' not in c or c.startswith('chr'))
 
-        header = self.bw.header()
+        for ti, tr in enumerate(self.tracks):
+            fsize = format_size(os.path.getsize(tr.filename))
+            if self.n_tracks > 1:
+                tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                print(f"\n  {tc}{C.BOLD}{tr.basename}{C.RESET}")
+            print(f"  {C.BOLD}File:{C.RESET}        {tr.filename}")
+            print(f"  {C.BOLD}Size:{C.RESET}        {fsize}")
+            print(f"  {C.BOLD}Chromosomes:{C.RESET} {len(tr.chroms)}")
 
-        print(f"  {C.BOLD}File:{C.RESET}        {self.filename}")
-        print(f"  {C.BOLD}Size:{C.RESET}        {fsize}")
-        print(f"  {C.BOLD}Chromosomes:{C.RESET} {len(self.chroms)} ({n_main} main)")
-        print(f"  {C.BOLD}Total span:{C.RESET}  {format_bp(total_bp)}")
-        if header:
-            if 'nBasesCovered' in header:
-                covered = header['nBasesCovered']
-                pct = 100 * covered / total_bp if total_bp > 0 else 0
-                print(f"  {C.BOLD}Bases covered:{C.RESET} {covered:,} ({pct:.1f}%)")
-            if 'minVal' in header:
-                print(f"  {C.BOLD}Value range:{C.RESET}  [{header['minVal']:.4f}, {header['maxVal']:.4f}]")
-            if 'sumData' in header and 'nBasesCovered' in header and header['nBasesCovered'] > 0:
-                mean = header['sumData'] / header['nBasesCovered']
-                print(f"  {C.BOLD}Mean (covered):{C.RESET} {mean:.4f}")
-            if 'sumSquared' in header and 'nBasesCovered' in header and header['nBasesCovered'] > 0:
-                n = header['nBasesCovered']
-                var = header['sumSquared'] / n - (header['sumData'] / n) ** 2
-                if var > 0:
-                    print(f"  {C.BOLD}Std (covered):{C.RESET}  {math.sqrt(var):.4f}")
+            header = tr.bw.header()
+            if header:
+                if 'nBasesCovered' in header:
+                    covered = header['nBasesCovered']
+                    t_bp = sum(tr.chroms.values())
+                    pct = 100 * covered / t_bp if t_bp > 0 else 0
+                    print(f"  {C.BOLD}Bases covered:{C.RESET} {covered:,} ({pct:.1f}%)")
+                if 'minVal' in header:
+                    print(f"  {C.BOLD}Value range:{C.RESET}  [{header['minVal']:.4f}, {header['maxVal']:.4f}]")
+                if 'sumData' in header and 'nBasesCovered' in header and header['nBasesCovered'] > 0:
+                    mean = header['sumData'] / header['nBasesCovered']
+                    print(f"  {C.BOLD}Mean (covered):{C.RESET} {mean:.4f}")
+
+        if self.n_tracks > 1:
+            print(f"\n  {C.BOLD}Union chroms:{C.RESET} {len(self.chroms)} ({n_main} main)")
+            print(f"  {C.BOLD}Total span:{C.RESET}  {format_bp(total_bp)}")
 
     complete_info = _complete_chrom
 
@@ -1819,24 +2188,26 @@ class BWShell(cmd.Cmd):
         """
         arg = arg.strip()
         if not arg:
-            ymin_s = "auto" if self.ymin is None else f"{self.ymin:.4g}"
-            ymax_s = "auto" if self.ymax is None else f"{self.ymax:.4g}"
-            print(f"  ylim: [{ymin_s}, {ymax_s}]")
+            for ti, t in enumerate(self.tracks):
+                ymin_s = "auto" if self.ymin[ti] is None else f"{self.ymin[ti]:.4g}"
+                ymax_s = "auto" if self.ymax[ti] is None else f"{self.ymax[ti]:.4g}"
+                prefix = f"  [{t.basename}] " if self.n_tracks > 1 else "  "
+                print(f"{prefix}ylim: [{ymin_s}, {ymax_s}]")
             return
         if arg.lower() == 'auto':
-            self.ymin = None
-            self.ymax = None
+            self.ymin = [None] * self.n_tracks
+            self.ymax = [None] * self.n_tracks
             print(f"  ylim: {C.BOLD}auto{C.RESET}")
             return
         parts = arg.split()
         try:
             if len(parts) == 1:
-                self.ymin = 0
-                self.ymax = float(parts[0])
+                ylo, yhi = 0, float(parts[0])
             else:
-                self.ymin = float(parts[0])
-                self.ymax = float(parts[1])
-            print(f"  ylim: {C.BOLD}[{self.ymin:.4g}, {self.ymax:.4g}]{C.RESET}")
+                ylo, yhi = float(parts[0]), float(parts[1])
+            self.ymin = [ylo] * self.n_tracks
+            self.ymax = [yhi] * self.n_tracks
+            print(f"  ylim: {C.BOLD}[{ylo:.4g}, {yhi:.4g}]{C.RESET}")
         except ValueError:
             print(f"  Invalid: {arg}. Use 'ylim ymin ymax' or 'ylim auto'")
 
@@ -1878,31 +2249,37 @@ class BWShell(cmd.Cmd):
 
         self._set_region(chrom, start, end)
 
-        # Use binned stats for large regions, per-base for small
-        if span <= 1_000_000:
-            vals = np.nan_to_num(
-                np.array(self.bw.values(chrom, start, end), dtype=np.float64), nan=0.0)
-        else:
-            nbins = min(span, 100_000)
-            vals = self._get_values_exact(chrom, start, end, nbins=nbins)
-
-        nonzero = vals[vals > 0]
-        coverage = len(nonzero) / len(vals) * 100 if len(vals) > 0 else 0
-
         print(f"  {C.BOLD}Region:{C.RESET}    {chrom}:{format_pos(start)}-{format_pos(end)}"
               f" ({format_bp(span)})")
-        print(f"  {C.BOLD}Min:{C.RESET}       {np.min(vals):.6g}")
-        print(f"  {C.BOLD}Max:{C.RESET}       {np.max(vals):.6g}")
-        print(f"  {C.BOLD}Mean:{C.RESET}      {np.mean(vals):.6g}")
-        print(f"  {C.BOLD}Std:{C.RESET}       {np.std(vals):.6g}")
-        if len(nonzero) > 0:
-            print(f"  {C.BOLD}Mean (nz):{C.RESET} {np.mean(nonzero):.6g}")
-        print(f"  {C.BOLD}Median:{C.RESET}    {np.median(vals):.6g}")
-        pcts = np.percentile(vals, [1, 25, 75, 99])
-        print(f"  {C.BOLD}P1/P25/P75/P99:{C.RESET} {pcts[0]:.4g} / {pcts[1]:.4g} / "
-              f"{pcts[2]:.4g} / {pcts[3]:.4g}")
-        print(f"  {C.BOLD}Coverage:{C.RESET}  {coverage:.1f}%")
-        print(f"  {C.BOLD}Sum:{C.RESET}       {np.sum(vals):.6g}")
+
+        for ti, tr in enumerate(self.tracks):
+            if self.n_tracks > 1:
+                tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                print(f"\n  {tc}{C.BOLD}{tr.basename}{C.RESET}")
+
+            # Use binned stats for large regions, per-base for small
+            if span <= 1_000_000:
+                vals = np.nan_to_num(
+                    np.array(tr.values(chrom, start, end), dtype=np.float64), nan=0.0)
+            else:
+                nbins = min(span, 100_000)
+                vals = self._get_values_exact_track(tr, chrom, start, end, nbins=nbins)
+
+            nonzero = vals[vals > 0]
+            coverage = len(nonzero) / len(vals) * 100 if len(vals) > 0 else 0
+
+            print(f"  {C.BOLD}Min:{C.RESET}       {np.min(vals):.6g}")
+            print(f"  {C.BOLD}Max:{C.RESET}       {np.max(vals):.6g}")
+            print(f"  {C.BOLD}Mean:{C.RESET}      {np.mean(vals):.6g}")
+            print(f"  {C.BOLD}Std:{C.RESET}       {np.std(vals):.6g}")
+            if len(nonzero) > 0:
+                print(f"  {C.BOLD}Mean (nz):{C.RESET} {np.mean(nonzero):.6g}")
+            print(f"  {C.BOLD}Median:{C.RESET}    {np.median(vals):.6g}")
+            pcts = np.percentile(vals, [1, 25, 75, 99])
+            print(f"  {C.BOLD}P1/P25/P75/P99:{C.RESET} {pcts[0]:.4g} / {pcts[1]:.4g} / "
+                  f"{pcts[2]:.4g} / {pcts[3]:.4g}")
+            print(f"  {C.BOLD}Coverage:{C.RESET}  {coverage:.1f}%")
+            print(f"  {C.BOLD}Sum:{C.RESET}       {np.sum(vals):.6g}")
 
     complete_stats = _complete_chrom
 
@@ -1933,30 +2310,38 @@ class BWShell(cmd.Cmd):
         end = min(size, end)
         span = end - start
 
-        vals = self._get_values(chrom, start, end)
-        # Optionally exclude zeros for cleaner histogram
-        nonzero = vals[vals > 0]
-        if len(nonzero) == 0:
-            print("  (all zeros)")
-            return
-
-        zero_frac = (len(vals) - len(nonzero)) / len(vals) * 100
-
-        counts, edges = np.histogram(nonzero, bins=bins)
-        max_count = max(counts)
         tw = shutil.get_terminal_size((80, 24)).columns
         bar_width = max(10, min(40, tw - 35))
 
-        print(f"  {C.DIM}(zeros: {zero_frac:.1f}% of {len(vals):,} bins, "
-              f"histogram of non-zero values){C.RESET}")
+        for ti, tr in enumerate(self.tracks):
+            vals = self._get_values_track(tr, chrom, start, end)
+            nonzero = vals[vals > 0]
+            if len(nonzero) == 0:
+                if self.n_tracks > 1:
+                    tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                    print(f"  {tc}{tr.basename}{C.RESET}: (all zeros)")
+                else:
+                    print("  (all zeros)")
+                continue
 
-        for i in range(len(counts)):
-            lo, hi = edges[i], edges[i + 1]
-            bar_len = int(counts[i] / max_count * bar_width) if max_count > 0 else 0
-            bar = '\u2588' * bar_len
-            pct = 100 * counts[i] / len(nonzero)
-            print(f"  [{lo:>9.3g},{hi:>9.3g})"
-                  f" {C.GREEN}{bar}{C.RESET} {counts[i]:>7,} ({pct:4.1f}%)")
+            zero_frac = (len(vals) - len(nonzero)) / len(vals) * 100
+            bc = TRACK_ANSI[ti % len(TRACK_ANSI)] if self.n_tracks > 1 else C.GREEN
+
+            if self.n_tracks > 1:
+                print(f"\n  {bc}{C.BOLD}{tr.basename}{C.RESET}")
+            print(f"  {C.DIM}(zeros: {zero_frac:.1f}% of {len(vals):,} bins, "
+                  f"histogram of non-zero values){C.RESET}")
+
+            counts, edges = np.histogram(nonzero, bins=bins)
+            max_count = max(counts)
+
+            for i in range(len(counts)):
+                lo, hi = edges[i], edges[i + 1]
+                bar_len = int(counts[i] / max_count * bar_width) if max_count > 0 else 0
+                bar = '\u2588' * bar_len
+                pct = 100 * counts[i] / len(nonzero)
+                print(f"  [{lo:>9.3g},{hi:>9.3g})"
+                      f" {bc}{bar}{C.RESET} {counts[i]:>7,} ({pct:4.1f}%)")
 
     complete_hist = _complete_chrom
 
@@ -1976,32 +2361,42 @@ class BWShell(cmd.Cmd):
         end = min(size, end)
         span = end - start
 
-        # Binary search for max position using binned stats
-        # Start with coarse bins, then narrow down
-        current_start, current_end = start, end
+        for ti, tr in enumerate(self.tracks):
+            if chrom not in tr.chroms:
+                if self.n_tracks > 1:
+                    tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                    print(f"  {tc}{tr.basename}{C.RESET}: (no {chrom})")
+                continue
 
-        for _ in range(20):  # max iterations
-            if current_end - current_start <= 100:
-                break
-            nbins = min(current_end - current_start, 1000)
-            stats = self.bw.stats(chrom, current_start, current_end,
-                                  type="max", nBins=nbins)
-            stats = [x if x is not None else 0 for x in stats]
-            max_bin = np.argmax(stats)
-            bin_size = (current_end - current_start) / nbins
-            current_start = max(start, int(current_start + max_bin * bin_size - bin_size))
-            current_end = min(end, int(current_start + 3 * bin_size))
+            # Binary search for max position using binned stats
+            current_start, current_end = start, end
+            for _ in range(20):
+                if current_end - current_start <= 100:
+                    break
+                nbins = min(current_end - current_start, 1000)
+                stats = tr.bw.stats(chrom, current_start, current_end,
+                                    type="max", nBins=nbins)
+                stats = [x if x is not None else 0 for x in stats]
+                max_bin = np.argmax(stats)
+                bin_size = (current_end - current_start) / nbins
+                current_start = max(start, int(current_start + max_bin * bin_size - bin_size))
+                current_end = min(end, int(current_start + 3 * bin_size))
 
-        # Get exact values in narrowed region
-        vals = self.bw.values(chrom, current_start, current_end)
-        vals = np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
-        max_idx = np.argmax(vals)
-        max_pos = current_start + max_idx
-        max_val = vals[max_idx]
+            vals = np.nan_to_num(
+                np.array(tr.values(chrom, current_start, current_end), dtype=np.float64), nan=0.0)
+            max_idx = np.argmax(vals)
+            max_pos = current_start + max_idx
+            max_val = vals[max_idx]
 
-        print(f"  {C.BOLD}Max:{C.RESET} {max_val:.6f} at {C.GREEN}{chrom}:{format_pos(max_pos)}{C.RESET}")
+            if self.n_tracks > 1:
+                tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                print(f"  {tc}{tr.basename}{C.RESET} {C.BOLD}Max:{C.RESET} {max_val:.6f}"
+                      f" at {C.GREEN}{chrom}:{format_pos(max_pos)}{C.RESET}")
+            else:
+                print(f"  {C.BOLD}Max:{C.RESET} {max_val:.6f}"
+                      f" at {C.GREEN}{chrom}:{format_pos(max_pos)}{C.RESET}")
 
-        # Show context
+        # Show context (use last max_pos)
         ctx = 500
         ctx_start = max(0, max_pos - ctx)
         ctx_end = min(size, max_pos + ctx)
@@ -2051,16 +2446,21 @@ class BWShell(cmd.Cmd):
                 continue
 
             span = end - start
-            st = self.bw.stats(chrom, start, end, type="mean", nBins=1)
-            st_max = self.bw.stats(chrom, start, end, type="max", nBins=1)
-
-            mean_val = st[0] if st and st[0] is not None else 0
-            max_val = st_max[0] if st_max and st_max[0] is not None else 0
-
             label = f"{name:>15} " if name else ""
-            print(f"  {label}{C.GREEN}{chrom}:{format_pos(start)}-{format_pos(end)}{C.RESET}"
-                  f"  {format_bp(span):>10}"
-                  f"  mean={mean_val:>8.3f}  max={max_val:>8.3f}")
+            line = (f"  {label}{C.GREEN}{chrom}:{format_pos(start)}-{format_pos(end)}{C.RESET}"
+                    f"  {format_bp(span):>10}")
+
+            for ti, tr in enumerate(self.tracks):
+                st = tr.stats(chrom, start, end, type="mean", nBins=1)
+                st_max = tr.stats(chrom, start, end, type="max", nBins=1)
+                mean_val = st[0] if st and st[0] is not None else 0
+                max_val = st_max[0] if st_max and st_max[0] is not None else 0
+                if self.n_tracks > 1:
+                    tc = TRACK_ANSI[ti % len(TRACK_ANSI)]
+                    line += f"  {tc}m={mean_val:.3f} M={max_val:.3f}{C.RESET}"
+                else:
+                    line += f"  mean={mean_val:>8.3f}  max={max_val:>8.3f}"
+            print(line)
 
             if show_view:
                 nbins = min(span, 60)
@@ -2089,27 +2489,52 @@ class BWShell(cmd.Cmd):
         start = max(0, start)
         end = min(size, end)
 
-        vals = self.bw.values(chrom, start, end)
-        vals = np.nan_to_num(np.array(vals, dtype=np.float64), nan=0.0)
+        # Fetch all track values
+        all_vals = []
+        for tr in self.tracks:
+            v = tr.values(chrom, start, end)
+            all_vals.append(np.nan_to_num(np.array(v, dtype=np.float64), nan=0.0))
 
         outfile = os.path.expanduser(outfile)
+        span = end - start
         if outfile.endswith('.npy'):
-            np.save(outfile, vals)
+            if self.n_tracks == 1:
+                np.save(outfile, all_vals[0])
+            else:
+                np.save(outfile, np.stack(all_vals))
         elif outfile.endswith('.bedgraph') or outfile.endswith('.bg'):
-            with open(outfile, 'w') as f:
-                for i, v in enumerate(vals):
-                    if v != 0:
-                        f.write(f"{chrom}\t{start + i}\t{start + i + 1}\t{v:.6f}\n")
+            if self.n_tracks > 1:
+                # Write per-track bedgraph files
+                base, ext = os.path.splitext(outfile)
+                for ti, tr in enumerate(self.tracks):
+                    fn = f"{base}.{tr.basename}{ext}"
+                    with open(fn, 'w') as f:
+                        for i, v in enumerate(all_vals[ti]):
+                            if v != 0:
+                                f.write(f"{chrom}\t{start + i}\t{start + i + 1}\t{v:.6f}\n")
+                    print(f"  Saved {span:,} values -> {fn}")
+                return
+            else:
+                with open(outfile, 'w') as f:
+                    for i, v in enumerate(all_vals[0]):
+                        if v != 0:
+                            f.write(f"{chrom}\t{start + i}\t{start + i + 1}\t{v:.6f}\n")
         elif outfile.endswith('.tsv') or outfile.endswith('.txt'):
             with open(outfile, 'w') as f:
-                f.write("chrom\tpos\tvalue\n")
-                for i, v in enumerate(vals):
-                    f.write(f"{chrom}\t{start + i}\t{v:.6f}\n")
+                hdr = "chrom\tpos"
+                for tr in self.tracks:
+                    hdr += f"\t{tr.basename}" if self.n_tracks > 1 else "\tvalue"
+                f.write(hdr + "\n")
+                for i in range(span):
+                    row = f"{chrom}\t{start + i}"
+                    for ti in range(self.n_tracks):
+                        row += f"\t{all_vals[ti][i]:.6f}"
+                    f.write(row + "\n")
         else:
             print(f"{C.RED}Unknown format. Use .npy, .bedgraph, or .tsv{C.RESET}")
             return
 
-        print(f"  Saved {len(vals):,} values -> {outfile}")
+        print(f"  Saved {span:,} values -> {outfile}")
 
     # ── Help ─────────────────────────────────────────────────
 
@@ -2223,7 +2648,8 @@ class BWShell(cmd.Cmd):
         return stop
 
     def close(self):
-        self.bw.close()
+        for t in self.tracks:
+            t.close()
 
 
 # ── Entry point ──────────────────────────────────────────────
@@ -2232,7 +2658,7 @@ def main():
     import argparse
     import textwrap
     parser = argparse.ArgumentParser(
-        description='bwsh - Interactive bigWig file explorer',
+        description='bwsh - Interactive bigWig file explorer (supports multiple tracks)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Interactive commands:
@@ -2253,18 +2679,20 @@ def main():
               chr1:1m-1.1m     1000-2000 (if cd'd)
         """),
     )
-    parser.add_argument('file', help='bigWig file to open')
+    parser.add_argument('files', nargs='+', metavar='FILE',
+                        help='bigWig file(s) to open')
     parser.add_argument('--no-color', action='store_true', help='Disable colors')
     parser.add_argument('-c', '--command', help='Run command and exit')
     parser.add_argument('--chroms', action='store_true', help='List chromosomes and exit')
 
     args = parser.parse_args()
 
-    if not os.path.isfile(args.file):
-        print(f"Error: {args.file}: No such file", file=sys.stderr)
-        sys.exit(1)
+    for fn in args.files:
+        if not os.path.isfile(fn):
+            print(f"Error: {fn}: No such file", file=sys.stderr)
+            sys.exit(1)
 
-    shell = BWShell(args.file, no_color=args.no_color)
+    shell = BWShell(args.files, no_color=args.no_color)
 
     try:
         if args.chroms:

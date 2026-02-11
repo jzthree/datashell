@@ -25,6 +25,7 @@ import tty
 import select
 import fcntl
 import struct
+import signal
 
 try:
     import numpy as np
@@ -1323,9 +1324,31 @@ class AShell(cmd.Cmd):
 
     # ── Terminal helpers (sixel / key reading) ────────────────
 
+    _resized = False
+
     def _read_key(self, fd):
         """Read a single keypress in raw/cbreak terminal mode."""
-        ch = os.read(fd, 1)
+        # Poll with timeout so SIGWINCH (which sets _resized) is detected
+        # promptly — Python 3.5+ auto-retries os.read on EINTR (PEP 475),
+        # so we can't rely on OSError to wake us up.
+        while True:
+            if self._resized:
+                self._resized = False
+                return 'RESIZE'
+            ready, _, _ = select.select([fd], [], [], 0.1)
+            if not ready:
+                continue
+            try:
+                ch = os.read(fd, 1)
+            except OSError:
+                self._resized = False
+                return 'RESIZE'
+            if not ch:
+                return ''
+            if self._resized:
+                self._resized = False
+                return 'RESIZE'
+            break
         if ch == b'\x1b':
             if select.select([fd], [], [], 0.05)[0]:
                 ch2 = os.read(fd, 1)
@@ -1726,13 +1749,18 @@ class AShell(cmd.Cmd):
         """Sixel browser for 1D h5py dataset."""
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
+        old_sigwinch = signal.getsignal(signal.SIGWINCH)
         total = ds.shape[0]
         col_start = 0
         col_span = total
         status_msg = ''
         DM, BO, RS = '\033[2m', '\033[1m', '\033[0m'
 
+        def _on_resize(signum, frame):
+            self._resized = True
+
         try:
+            signal.signal(signal.SIGWINCH, _on_resize)
             tty.setcbreak(fd)
             sys.stdout.write('\033[?25l')
             sys.stdout.flush()
@@ -1797,6 +1825,8 @@ class AShell(cmd.Cmd):
                 status_msg = ''
 
                 key = self._read_key(fd)
+                if key == 'RESIZE':
+                    continue
                 if key == 'q' or key == 'ESC':
                     break
                 elif key in ('h', 'LEFT'):
@@ -1842,6 +1872,7 @@ class AShell(cmd.Cmd):
                                   f"std={float(np.std(vals)):.4g}")
 
         finally:
+            signal.signal(signal.SIGWINCH, old_sigwinch)
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
             sys.stdout.write('\033[?25h\033[2J\033[H')
             sys.stdout.flush()
@@ -1874,7 +1905,6 @@ class AShell(cmd.Cmd):
         col_start = 0
         col_span = total
         status_msg = ''
-
         while True:
             col_start = max(0, min(col_start, total - 10))
             col_end = min(col_start + col_span, total)
@@ -1959,6 +1989,20 @@ class AShell(cmd.Cmd):
             status_msg = ''
 
             key = stdscr.getch()
+
+            if key == curses.KEY_RESIZE:
+                # Debounce: drain queued resize events, wait for settle
+                stdscr.timeout(50)
+                while stdscr.getch() != -1:
+                    pass
+                stdscr.timeout(-1)
+                # Use actual OS size (curses internal may be stale)
+                actual = shutil.get_terminal_size()
+                curses.resizeterm(actual.lines, actual.columns)
+                stdscr.clear()
+                stdscr.refresh()
+                continue
+
             if key == ord('q') or key == 27:
                 break
             elif key == curses.KEY_LEFT or key == ord('h'):
@@ -1986,12 +2030,6 @@ class AShell(cmd.Cmd):
             elif key == ord('s'):
                 status_msg = (f"min={float(np.min(vals)):.4g}  max={vmax:.4g}  "
                               f"mean={vmean:.4g}  std={float(np.std(vals)):.4g}")
-            elif key == curses.KEY_RESIZE:
-                try:
-                    curses.update_lines_cols()
-                except AttributeError:
-                    pass
-                stdscr.clear()
 
     def _browse_1d_curses_mem(self, stdscr, data, label):
         """Curses browser for in-memory 1D array."""
@@ -2010,6 +2048,7 @@ class AShell(cmd.Cmd):
         """Sixel heatmap browser for 2D h5py dataset."""
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
+        old_sigwinch = signal.getsignal(signal.SIGWINCH)
         n_rows, n_cols = ds.shape
         col_start = 0
         col_span = n_cols
@@ -2017,7 +2056,11 @@ class AShell(cmd.Cmd):
         status_msg = ''
         DM, BO, RS = '\033[2m', '\033[1m', '\033[0m'
 
+        def _on_resize(signum, frame):
+            self._resized = True
+
         try:
+            signal.signal(signal.SIGWINCH, _on_resize)
             tty.setcbreak(fd)
             sys.stdout.write('\033[?25l')
             sys.stdout.flush()
@@ -2100,6 +2143,8 @@ class AShell(cmd.Cmd):
                 status_msg = ''
 
                 key = self._read_key(fd)
+                if key == 'RESIZE':
+                    continue
                 if key == 'q' or key == 'ESC':
                     break
                 elif key in ('h', 'LEFT'):
@@ -2152,6 +2197,7 @@ class AShell(cmd.Cmd):
                                   f"std={float(np.std(data)):.4g}")
 
         finally:
+            signal.signal(signal.SIGWINCH, old_sigwinch)
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
             sys.stdout.write('\033[?25h\033[2J\033[H')
             sys.stdout.flush()
@@ -2181,7 +2227,6 @@ class AShell(cmd.Cmd):
         col_span = n_cols
         row_start = 0
         status_msg = ''
-
         while True:
             col_start = max(0, col_start)
             col_end = min(col_start + col_span, n_cols)
@@ -2261,6 +2306,20 @@ class AShell(cmd.Cmd):
             status_msg = ''
 
             key = stdscr.getch()
+
+            if key == curses.KEY_RESIZE:
+                # Debounce: drain queued resize events, wait for settle
+                stdscr.timeout(50)
+                while stdscr.getch() != -1:
+                    pass
+                stdscr.timeout(-1)
+                # Use actual OS size (curses internal may be stale)
+                actual = shutil.get_terminal_size()
+                curses.resizeterm(actual.lines, actual.columns)
+                stdscr.clear()
+                stdscr.refresh()
+                continue
+
             if key == ord('q') or key == 27:
                 break
             elif key == curses.KEY_LEFT or key == ord('h'):
@@ -2294,12 +2353,6 @@ class AShell(cmd.Cmd):
                 status_msg = (f"min={vmin:.4g}  max={vmax_d:.4g}  "
                               f"mean={float(np.mean(data)):.4g}  "
                               f"std={float(np.std(data)):.4g}")
-            elif key == curses.KEY_RESIZE:
-                try:
-                    curses.update_lines_cols()
-                except AttributeError:
-                    pass
-                stdscr.clear()
 
     def _browse_2d_curses_mem(self, stdscr, data, label):
         """Curses heatmap browser for in-memory 2D array."""

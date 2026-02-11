@@ -37,20 +37,24 @@ The interactive browser renders pixel-level graphics via sixel protocol (with au
 
 ### bwsh - BigWig Explorer
 
-An interactive shell for bigWig genomic signal files. Browse chromosome-wide signal tracks with a built-in genome browser.
+An interactive shell for bigWig genomic signal files. Browse chromosome-wide signal tracks with a built-in genome browser. Supports multiple tracks for side-by-side comparison.
 
 ```
 bwsh signal.bw
+bwsh treatment.bw control.bw        # multi-track comparison
 ```
 
 **Features:**
+- **Multi-track support** — open 2-3 bigWig files simultaneously, stacked with per-track colors
 - Chromosome navigation (`chroms`, `cd`, `pwd`)
 - Signal visualization (`view`, `peek`, `browse`)
 - Interactive genome browser with sixel pixel rendering and curses fallback
+- Zero-baseline rendering — positive signal fills up, negative fills down
 - Pan/zoom with vim-style keys, zoom presets (100bp to 100Mb)
 - Theme-aware rendering (auto-detects light/dark terminal)
 - Configurable y-axis limits and NaN handling (mean vs nanmean)
 - Region statistics, histograms, BED file analysis
+- Multi-column output for `cat`, `head`, `tail`, `stats`, `export` with multiple tracks
 - Export to `.npy`, `.bedgraph`, `.tsv`
 
 <!-- ![bwsh genome browser](screenshots/bwsh_browser.png) -->
@@ -59,7 +63,7 @@ bwsh signal.bw
 
 Both tools are standalone Python scripts with minimal dependencies.
 
-**Requirements:** Python 3.7+, numpy
+**Requirements:** Python 3.8+, numpy, a modern terminal emulator
 
 ```bash
 # ash (array shell — HDF5, npy, npz)
@@ -75,7 +79,7 @@ cp bwsh ~/bin/
 chmod +x ~/bin/bwsh
 ```
 
-**Optional:** A sixel-capable terminal (iTerm2, WezTerm, foot, xterm) enables pixel-level graphics in the interactive browser. Without sixel support, both tools automatically fall back to curses text-mode rendering.
+**Terminal:** A modern terminal with sixel support is recommended for the best experience. Tested with iTerm2, WezTerm, foot, and xterm. Without sixel support, both tools fall back to curses text-mode rendering (half-block, block, and braille modes).
 
 ## Quick Reference
 
