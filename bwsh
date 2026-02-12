@@ -521,7 +521,18 @@ class BWShell(cmd.Cmd):
             return
 
         name = arg.strip()
+        if name == '-':
+            prev = getattr(self, '_prev_chrom', None)
+            if prev and prev in self.chroms:
+                self._prev_chrom = self.chrom
+                self.chrom = prev
+                self.region = None
+                self._update_prompt()
+            else:
+                print(f"{C.DIM}No previous chromosome{C.RESET}")
+            return
         if name in self.chroms:
+            self._prev_chrom = self.chrom
             self.chrom = name
             self.region = None
             self._update_prompt()
@@ -529,6 +540,7 @@ class BWShell(cmd.Cmd):
             # Case-insensitive search
             for c in self.chroms:
                 if c.lower() == name.lower():
+                    self._prev_chrom = self.chrom
                     self.chrom = c
                     self.region = None
                     self._update_prompt()
@@ -981,7 +993,7 @@ class BWShell(cmd.Cmd):
 
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-        except:
+        except Exception:
             pass
 
         status_msg = ""
@@ -1111,7 +1123,7 @@ class BWShell(cmd.Cmd):
                                       f"cov={len(nz)/len(vals)*100:.0f}%")
                     else:
                         status_msg = "No signal in region"
-                except:
+                except Exception:
                     status_msg = "Stats error"
 
             elif key == ord('n'):
@@ -1152,7 +1164,7 @@ class BWShell(cmd.Cmd):
                         new_span = min(size, span * 3 // 2)
                         start = center - new_span // 2
                         end = start + new_span
-                except:
+                except Exception:
                     pass
 
         self._set_region(chrom, start, end)
@@ -1300,7 +1312,7 @@ class BWShell(cmd.Cmd):
             try:
                 mini_vals = self.tracks[0].stats(chrom, 0, size, type="mean", nBins=mini_width)
                 mini_arr = np.nan_to_num(np.array(mini_vals, dtype=np.float64), nan=0.0)
-            except:
+            except Exception:
                 mini_arr = np.zeros(mini_width)
 
             mini_max = np.max(mini_arr) if len(mini_arr) > 0 else 1
@@ -1520,7 +1532,7 @@ class BWShell(cmd.Cmd):
         try:
             raw = stdscr.getstr(y, len(prompt), min(60, width - len(prompt) - 1))
             result = raw.decode('utf-8').strip()
-        except:
+        except Exception:
             result = ""
         curses.noecho()
         curses.curs_set(0)
@@ -1580,7 +1592,7 @@ class BWShell(cmd.Cmd):
             rows, cols, xpix, ypix = struct.unpack('HHHH', result)
             if xpix > 0 and ypix > 0:
                 return rows, cols, xpix, ypix
-        except:
+        except Exception:
             pass
         # Fallback: estimate from character size
         rows, cols = shutil.get_terminal_size()
@@ -1630,7 +1642,7 @@ class BWShell(cmd.Cmd):
             return 'ENTER'
         try:
             return ch.decode('ascii')
-        except:
+        except Exception:
             return ''
 
     def _read_line_esc(self, fd):
@@ -1864,7 +1876,7 @@ class BWShell(cmd.Cmd):
                 for ti, tr in enumerate(self.tracks):
                     try:
                         v = self._get_values_exact_track(tr, chrom, start, end, nbins=nbins)
-                    except:
+                    except Exception:
                         v = np.zeros(nbins)
                     track_vals.append(v)
                     dmin = np.min(v) if len(v) > 0 else 0
@@ -2036,7 +2048,7 @@ class BWShell(cmd.Cmd):
                             else:
                                 parts_s.append(f"{tr.basename}: no signal" if nt > 1 else "No signal")
                         status_msg = '  |  '.join(parts_s)
-                    except:
+                    except Exception:
                         status_msg = "Stats error"
                 elif key == 'n':
                     self.nan_zero = not self.nan_zero
@@ -2360,6 +2372,7 @@ class BWShell(cmd.Cmd):
         start = max(0, start)
         end = min(size, end)
         span = end - start
+        max_pos = None
 
         for ti, tr in enumerate(self.tracks):
             if chrom not in tr.chroms:
@@ -2396,11 +2409,12 @@ class BWShell(cmd.Cmd):
                 print(f"  {C.BOLD}Max:{C.RESET} {max_val:.6f}"
                       f" at {C.GREEN}{chrom}:{format_pos(max_pos)}{C.RESET}")
 
-        # Show context (use last max_pos)
-        ctx = 500
-        ctx_start = max(0, max_pos - ctx)
-        ctx_end = min(size, max_pos + ctx)
-        print(f"  {C.DIM}View context: view {chrom}:{ctx_start}-{ctx_end}{C.RESET}")
+        # Show context
+        if max_pos is not None:
+            ctx = 500
+            ctx_start = max(0, max_pos - ctx)
+            ctx_end = min(size, max_pos + ctx)
+            print(f"  {C.DIM}View context: view {chrom}:{ctx_start}-{ctx_end}{C.RESET}")
 
     complete_max = _complete_chrom
 
@@ -2464,8 +2478,10 @@ class BWShell(cmd.Cmd):
 
             if show_view:
                 nbins = min(span, 60)
-                vals = self._get_values_exact(chrom, start, end, nbins=nbins)
-                print(f"  {'':>15} {C.DIM}{sparkline(vals, width=60)}{C.RESET}")
+                for ti, tr in enumerate(self.tracks):
+                    vals = self._get_values_exact_track(tr, chrom, start, end, nbins=nbins)
+                    sc = TRACK_ANSI[ti % len(TRACK_ANSI)] if self.n_tracks > 1 else C.DIM
+                    print(f"  {'':>15} {sc}{sparkline(vals, width=60)}{C.RESET}")
 
         if len(regions) > 100:
             print(f"\n  {C.YELLOW}... showing first 100 of {len(regions)} regions{C.RESET}")
